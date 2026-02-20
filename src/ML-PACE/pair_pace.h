@@ -34,6 +34,9 @@ PairStyle(pace,PairPACE);
 
 #include "pair.h"
 
+#include <utility>
+#include <vector>
+
 namespace LAMMPS_NS {
 
 class PairPACE : public Pair {
@@ -49,6 +52,12 @@ class PairPACE : public Pair {
 
   void *extract(const char *, int &) override;
   void *extract_peratom(const char *, int &) override;
+
+  // local-energy helpers used by fix atom/swap localE
+  double compute_atom_energy(int i);
+  double build_atom_energy_cache(double *eatom, int nmax_eatom);
+  double compute_shell_delta(tagint tag_i, tagint tag_j, const double *eatom_cached,
+                             std::vector<std::pair<int, double>> &changed);
 
  protected:
   struct ACEImpl *aceimpl;

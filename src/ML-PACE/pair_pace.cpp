@@ -41,6 +41,8 @@ Copyright 2021 Yury Lysogorskiy^1, Cas van der Oord^2, Anton Bochkarev^1,
 
 #include <cstring>
 #include <exception>
+#include <utility>
+#include <vector>
 
 #include "ace-evaluator/ace_c_basis.h"
 #include "ace-evaluator/ace_evaluator.h"
@@ -240,6 +242,99 @@ void PairPACE::compute(int eflag, int vflag)
   if (vflag_fdotr) virial_fdotr_compute();
 
   // end modifications YL
+}
+
+/* ----------------------------------------------------------------------
+   compute and return the ACE energy for single atom i (energy_only mode)
+   precondition: ACE neighbours cache is already sized for >= numneigh[i]
+------------------------------------------------------------------------- */
+
+double PairPACE::compute_atom_energy(int i)
+{
+  const int itype = atom->type[i];
+  aceimpl->ace->energy_only = true;
+  try {
+    aceimpl->ace->compute_atom(i, atom->x, atom->type, list->numneigh[i], list->firstneigh[i]);
+  } catch (std::exception &e) {
+    error->one(FLERR, e.what());
+  }
+  aceimpl->ace->energy_only = false;
+  return scale[itype][itype] * aceimpl->ace->e_atom;
+}
+
+/* ----------------------------------------------------------------------
+   fill eatom[i] for every local atom; return local sum of energies.
+   used to build the per-atom energy cache at the start of each MC block.
+------------------------------------------------------------------------- */
+
+double PairPACE::build_atom_energy_cache(double *eatom, int /*nmax_eatom*/)
+{
+  // size ACE neighbour cache once for the largest neighbour list on this rank
+  int max_jnum = 0;
+  for (int ii = 0; ii < list->inum; ii++) {
+    int i = list->ilist[ii];
+    if (list->numneigh[i] > max_jnum) max_jnum = list->numneigh[i];
+  }
+  if (max_jnum > 0) aceimpl->ace->resize_neighbours_cache(max_jnum);
+
+  double local_sum = 0.0;
+  for (int ii = 0; ii < list->inum; ii++) {
+    int i = list->ilist[ii];
+    eatom[i] = compute_atom_energy(i);
+    local_sum += eatom[i];
+  }
+  return local_sum;
+}
+
+/* ----------------------------------------------------------------------
+   after a type swap, find every local atom whose ACE energy changed,
+   recompute it, accumulate local dE = sum(new_e - eatom_cached[k]).
+   fills changed[] with (local_index, new_energy) pairs for cache update.
+   returns the local contribution to dE; caller must MPI_Allreduce.
+------------------------------------------------------------------------- */
+
+double PairPACE::compute_shell_delta(tagint tag_i, tagint tag_j,
+                                      const double *eatom_cached,
+                                      std::vector<std::pair<int, double>> &changed)
+{
+  changed.clear();
+  tagint *tag       = atom->tag;
+  int *numneigh     = list->numneigh;
+  int **firstneigh  = list->firstneigh;
+
+  // resize ACE cache once for max neighbour count across all local atoms
+  int max_jnum = 0;
+  for (int ii = 0; ii < list->inum; ii++) {
+    int i = list->ilist[ii];
+    if (numneigh[i] > max_jnum) max_jnum = numneigh[i];
+  }
+  if (max_jnum > 0) aceimpl->ace->resize_neighbours_cache(max_jnum);
+
+  double local_dE = 0.0;
+  for (int ii = 0; ii < list->inum; ii++) {
+    int k = list->ilist[ii];
+
+    // atom k is affected if it IS a swapped atom or has one in its neighbour list
+    bool affected = (tag[k] == tag_i || tag[k] == tag_j);
+    if (!affected) {
+      int jnum    = numneigh[k];
+      int *jlist_k = firstneigh[k];
+      for (int jj = 0; jj < jnum; jj++) {
+        tagint jtag = tag[jlist_k[jj] & NEIGHMASK];
+        if (jtag == tag_i || jtag == tag_j) {
+          affected = true;
+          break;
+        }
+      }
+    }
+
+    if (affected) {
+      double new_e = compute_atom_energy(k);
+      local_dE += new_e - eatom_cached[k];
+      changed.emplace_back(k, new_e);
+    }
+  }
+  return local_dE;
 }
 
 /* ---------------------------------------------------------------------- */

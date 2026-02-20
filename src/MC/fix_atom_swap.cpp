@@ -37,6 +37,7 @@
 #include "neighbor.h"
 #include "pair.h"
 #include "pair_hybrid.h"
+#include "pair_pace.h"
 #include "random_park.h"
 #include "region.h"
 #include "suffix.h"
@@ -98,6 +99,9 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   // default value for multi-swap count
   nswap_count = 1;
   noforce_flag = 0;
+  local_energy_flag = 0;
+  eatom_cached = nullptr;
+  eatom_cached_nmax = 0;
 
   // read options from end of input line
 
@@ -152,6 +156,7 @@ FixAtomSwap::~FixAtomSwap()
   delete random_unequal;
   memory->destroy(imgobjs);
   memory->destroy(imgparms);
+  memory->destroy(eatom_cached);
 }
 
 /* ----------------------------------------------------------------------
@@ -212,6 +217,10 @@ void FixAtomSwap::options(int narg, char **arg)
     } else if (strcmp(arg[iarg], "noforce") == 0) {
       if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
       noforce_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "localE") == 0) {
+      if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+      local_energy_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else
       error->all(FLERR, "Illegal fix atom/swap command");
@@ -406,6 +415,28 @@ void FixAtomSwap::init()
         if (cutsq[type_list[iswaptype]][ktype] != cutsq[type_list[jswaptype]][ktype])
           unequal_cutoffs = true;
 
+  // localE validation: PACE-only, single-swap, equal cutoffs
+  if (local_energy_flag) {
+    if (nswap_count > 1)
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Fix atom/swap localE is not compatible with swap_count > 1");
+    if (semi_grand_flag)
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Fix atom/swap localE is not compatible with semi-grand");
+    if (!utils::strmatch(force->pair_style, "^pace"))
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Fix atom/swap localE requires pair style pace");
+    if (unequal_cutoffs)
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Fix atom/swap localE is not compatible with unequal type cutoffs");
+    // pre-allocate the per-atom energy cache
+    if (atom->nlocal > eatom_cached_nmax) {
+      memory->destroy(eatom_cached);
+      eatom_cached_nmax = atom->nlocal + 100;
+      memory->create(eatom_cached, eatom_cached_nmax, "atom/swap:eatom_cached");
+    }
+  }
+
   // check that no swappable atoms are in atom->firstgroup
   // swapping such an atom might not leave firstgroup atoms first
 
@@ -449,7 +480,11 @@ void FixAtomSwap::pre_exchange()
   // energy_stored = energy of current state
   // will be updated after accepted swaps
 
-  energy_stored = energy_full();
+  // energy_stored = energy of current state (full or cached per-atom sum)
+  if (local_energy_flag)
+    energy_stored = build_eatom_cache();
+  else
+    energy_stored = energy_full();
 
   // attempt Ncycle atom swaps
 
@@ -635,6 +670,17 @@ int FixAtomSwap::attempt_swap()
       j_picks[k] = local_swap_jatom_list[jwhichglobal - njswap_before];
   }
 
+  // for localE: broadcast the global atom tags of the selected pair to all ranks
+  tagint tag_i_global = 0, tag_j_global = 0;
+  if (local_energy_flag) {
+    tagint tags_send[2] = {(i_picks[0] >= 0) ? atom->tag[i_picks[0]] : (tagint) 0,
+                           (j_picks[0] >= 0) ? atom->tag[j_picks[0]] : (tagint) 0};
+    tagint tags_recv[2] = {0, 0};
+    MPI_Allreduce(tags_send, tags_recv, 2, MPI_LMP_TAGINT, MPI_SUM, world);
+    tag_i_global = tags_recv[0];
+    tag_j_global = tags_recv[1];
+  }
+
   // swap types (and charges/masses) of all selected atoms
 
   for (int k = 0; k < nswap_count; k++) {
@@ -670,9 +716,21 @@ int FixAtomSwap::attempt_swap()
     comm->forward_comm(this);
   }
 
-  // post-swap energy
+  // post-swap energy: local shell approximation (localE) or full pair compute
 
-  double energy_after = energy_full();
+  double energy_after;
+  std::vector<std::pair<int, double>> changed_atoms;
+
+  if (local_energy_flag) {
+    auto *pace = dynamic_cast<PairPACE *>(force->pair);
+    double local_dE = pace->compute_shell_delta(tag_i_global, tag_j_global,
+                                                eatom_cached, changed_atoms);
+    double total_dE;
+    MPI_Allreduce(&local_dE, &total_dE, 1, MPI_DOUBLE, MPI_SUM, world);
+    energy_after = energy_stored + total_dE;
+  } else {
+    energy_after = energy_full();
+  }
 
   // swap accepted, return 1
   // if ke_flag, rescale atom velocities
@@ -704,6 +762,9 @@ int FixAtomSwap::attempt_swap()
         }
       }
     }
+    // update per-atom energy cache with recomputed shell energies
+    if (local_energy_flag)
+      for (auto &[idx, new_e] : changed_atoms) eatom_cached[idx] = new_e;
     energy_stored = energy_after;
     return 1;
   }
@@ -727,6 +788,9 @@ int FixAtomSwap::attempt_swap()
       if (atom->rmass != nullptr) atom->rmass[j] = mtype[1];
     }
   }
+
+  // re-sync ghost types after rejected swap so next trial sees correct types
+  if (local_energy_flag && !unequal_cutoffs) comm->forward_comm(this);
 
   return 0;
 }
@@ -759,6 +823,29 @@ double FixAtomSwap::energy_full()
 
   update->eflag_global = update->ntimestep;
   return c_pe->compute_scalar();
+}
+
+/* ----------------------------------------------------------------------
+   build the per-atom ACE energy cache after reneighboring.
+   returns the global total PE (sum of all e_atom over all ranks).
+------------------------------------------------------------------------- */
+
+double FixAtomSwap::build_eatom_cache()
+{
+  auto *pace = dynamic_cast<PairPACE *>(force->pair);
+
+  // grow array if nlocal has increased since last allocation
+  int nlocal = atom->nlocal;
+  if (nlocal > eatom_cached_nmax) {
+    memory->destroy(eatom_cached);
+    eatom_cached_nmax = nlocal + 100;
+    memory->create(eatom_cached, eatom_cached_nmax, "atom/swap:eatom_cached");
+  }
+
+  double local_sum = pace->build_atom_energy_cache(eatom_cached, eatom_cached_nmax);
+  double global_sum;
+  MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, world);
+  return global_sum;
 }
 
 /* ----------------------------------------------------------------------
