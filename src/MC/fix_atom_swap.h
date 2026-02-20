@@ -52,6 +52,9 @@ class FixAtomSwap : public Fix {
   int ncycles;
   int nswap_count;             // number of atom pairs to swap per MC move
   int noforce_flag;            // 1 = skip force accumulation during MC energy evals
+  int local_energy_flag;       // 1 = use local shell energy (PACE only, nswap_count=1)
+  double *eatom_cached;        // cached per-local-atom ACE energies
+  int eatom_cached_nmax;       // allocated size of eatom_cached
   int niswap, njswap;                  // # of i,j swap atoms on all procs
   int niswap_local, njswap_local;      // # of swap atoms on this proc
   int niswap_before, njswap_before;    // # of swap atoms on procs < this proc
@@ -95,6 +98,7 @@ class FixAtomSwap : public Fix {
   int vizsteps;                    // number of steps to highlight atoms in reactions
 
   void options(int, char **);
+  double build_eatom_cache();
   int attempt_semi_grand();
   int attempt_swap();
   double energy_full();

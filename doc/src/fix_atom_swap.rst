@@ -17,7 +17,7 @@ Syntax
 * seed = random # seed (positive integer)
 * T = scaling temperature of the MC swaps (temperature units)
 * one or more keyword/value pairs may be appended to args
-* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce*
+* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE*
 
   .. parsed-literal::
 
@@ -36,6 +36,9 @@ Syntax
        *noforce* value = *no* or *yes*
          *no* = compute full energy and forces during MC energy evaluation
          *yes* = skip force accumulation during MC energy evaluation (energy only)
+       *localE* value = *no* or *yes*
+         *no* = evaluate full system energy for each MC trial
+         *yes* = evaluate only the local coordination-shell energy change (PACE only)
 
 Examples
 """"""""
@@ -47,6 +50,7 @@ Examples
    fix SGMC all atom/swap 1 100 345 1.0 semi-grand yes types 1 2 3 mu 0.0 4.3 -5.0
    fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5
    fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
+   fix localSwap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
 
 Description
 """""""""""
@@ -142,6 +146,27 @@ next regular MD timestep.  The speedup is largest for ML potentials
 (e.g. ML-PACE/ACE) where the force loop dominates compute time.  Not
 all pair styles support this flag; styles that do not will simply
 ignore it and compute forces as normal.
+
+.. versionchanged:: TBD
+
+The *localE* keyword activates a local coordination-shell energy
+approximation for the MC acceptance criterion.  When set to *yes*,
+the fix maintains a cached array of per-atom ACE energies (built once
+per MD step after reneighboring) and evaluates the energy change of a
+swap trial by recomputing only the energy of the two swapped atoms and
+their first coordination shells (typically ~50-100 atoms), rather than
+performing a full system-wide pair compute.  The energy change is exact
+within the ACE formalism because each atom's energy depends only on its
+own neighbour shell.  The cache is updated incrementally on accepted
+swaps and rebuilt from scratch at the start of each MC block.
+
+This option is currently supported only with *pair_style pace* and
+requires *swap_count* = 1 and *semi-grand* = no.  It is not compatible
+with unequal pair cutoffs between the swap types.  On parallel runs,
+a single ``MPI_Allreduce`` per trial replaces the full pair compute
+reduction.  The expected speedup over *noforce yes* is proportional to
+N / Z, where N is the number of atoms and Z is the coordination number
+(typically 50-80x for a 4000-atom system).
 
 You should ensure you do not swap atoms belonging to a molecule, or
 LAMMPS will eventually generate an error when it tries to find those
@@ -277,7 +302,7 @@ Default
 """""""
 
 The option defaults are *ke* = yes, *semi-grand* = no, *mu* = 0.0 for
-all atom types, *swap_count* = 1, *noforce* = no.
+all atom types, *swap_count* = 1, *noforce* = no, *localE* = no.
 
 ----------
 
