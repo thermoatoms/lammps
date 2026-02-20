@@ -10,11 +10,8 @@ else()
       cmake_policy(SET CMP0135 OLD)
     endif()
 
-    set(PACELIB_URL "https://github.com/ICAMS/lammps-user-pace/archive/refs/tags/v.2023.11.25.fix2.tar.gz" CACHE STRING "URL for PACE evaluator library sources")
-    set(PACELIB_MD5 "a53bd87cfee8b07d9f44bc17aad69c3f" CACHE STRING "MD5 checksum of PACE evaluator library tarball")
+    set(PACELIB_URL "https://github.com/thermoatoms/lammps-user-pace/archive/refs/heads/main.tar.gz" CACHE STRING "URL for PACE evaluator library sources")
     mark_as_advanced(PACELIB_URL)
-    mark_as_advanced(PACELIB_MD5)
-    GetFallbackURL(PACELIB_URL PACELIB_FALLBACK)
 
     # LOCAL_ML-PACE points to top-level dir with local lammps-user-pace repo,
     # to make it easier to check local build without going through the public github releases.
@@ -29,20 +26,11 @@ else()
     if(LOCAL_ML-PACE)
      set(lib-pace "${LOCAL_ML-PACE}")
     else()
-      # download library sources to build folder
-      if(EXISTS ${CMAKE_BINARY_DIR}/libpace.tar.gz)
-        file(MD5 ${CMAKE_BINARY_DIR}/libpace.tar.gz DL_MD5)
-      endif()
-      if(NOT "${DL_MD5}" STREQUAL "${PACELIB_MD5}")
-        message(STATUS "Downloading ${PACELIB_URL}")
-        file(DOWNLOAD ${PACELIB_URL} ${CMAKE_BINARY_DIR}/libpace.tar.gz STATUS DL_STATUS SHOW_PROGRESS)
-        file(MD5 ${CMAKE_BINARY_DIR}/libpace.tar.gz DL_MD5)
-        if((NOT DL_STATUS EQUAL 0) OR (NOT "${DL_MD5}" STREQUAL "${PACELIB_MD5}"))
-          message(WARNING "Download from primary URL ${PACELIB_URL} failed\nTrying fallback URL ${PACELIB_FALLBACK}")
-          file(DOWNLOAD ${PACELIB_FALLBACK} ${CMAKE_BINARY_DIR}/libpace.tar.gz EXPECTED_HASH MD5=${PACELIB_MD5} SHOW_PROGRESS)
-        endif()
-      else()
-        message(STATUS "Using already downloaded archive ${CMAKE_BINARY_DIR}/libpace.tar.gz")
+      # always download fresh from fork to pick up latest changes
+      message(STATUS "Downloading ${PACELIB_URL}")
+      file(DOWNLOAD ${PACELIB_URL} ${CMAKE_BINARY_DIR}/libpace.tar.gz STATUS DL_STATUS SHOW_PROGRESS)
+      if(NOT DL_STATUS EQUAL 0)
+        message(FATAL_ERROR "Download of PACE library from ${PACELIB_URL} failed")
       endif()
 
 
