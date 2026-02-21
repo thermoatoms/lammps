@@ -103,6 +103,11 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   local_energy_flag = 0;
   eatom_cached = nullptr;
   eatom_cached_nmax = 0;
+  split_cache_flag = 0;
+  invariant_substyle = -1;
+  eatom_sA = nullptr;
+  eatom_sB = nullptr;
+  eatom_s_nmax = 0;
 
   // read options from end of input line
 
@@ -158,6 +163,8 @@ FixAtomSwap::~FixAtomSwap()
   memory->destroy(imgobjs);
   memory->destroy(imgparms);
   memory->destroy(eatom_cached);
+  memory->destroy(eatom_sA);
+  memory->destroy(eatom_sB);
 }
 
 /* ----------------------------------------------------------------------
@@ -453,6 +460,29 @@ void FixAtomSwap::init()
       eatom_cached_nmax = atom->nlocal + 100;
       memory->create(eatom_cached, eatom_cached_nmax, "atom/swap:eatom_cached");
     }
+
+    // detect type-invariant sub-style (e.g. "Au Au" endpoint in alchemical TI)
+    split_cache_flag = 0;
+    invariant_substyle = -1;
+    if (pace_substyles.size() == 2) {
+      for (int s = 0; s < 2; s++) {
+        if (pace_substyles[s].first->is_type_invariant(type_list[0], type_list[1])) {
+          invariant_substyle = s;
+          split_cache_flag = 1;
+          break;
+        }
+      }
+    }
+    // allocate per-style unscaled cache arrays for the split-cache path
+    if (split_cache_flag) {
+      if (atom->nlocal > eatom_s_nmax) {
+        memory->destroy(eatom_sA);
+        memory->destroy(eatom_sB);
+        eatom_s_nmax = atom->nlocal + 100;
+        memory->create(eatom_sA, eatom_s_nmax, "atom/swap:eatom_sA");
+        memory->create(eatom_sB, eatom_s_nmax, "atom/swap:eatom_sB");
+      }
+    }
   }
 
   // check that no swappable atoms are in atom->firstgroup
@@ -738,6 +768,7 @@ int FixAtomSwap::attempt_swap()
 
   double energy_after;
   std::vector<std::pair<int, double>> changed_atoms;
+  std::vector<double> changed_eB;  // new type-aware energies (split-cache path only)
 
   if (local_energy_flag) {
     double local_dE;
@@ -751,12 +782,26 @@ int FixAtomSwap::attempt_swap()
       std::vector<int> affected;
       pace_substyles[0].first->get_affected_local_atoms(tag_i_global, tag_j_global, affected);
       local_dE = 0.0;
-      for (int k : affected) {
-        double new_e = 0.0;
-        for (auto &[pace_s, scale_s] : pace_substyles)
-          new_e += scale_s * pace_s->compute_atom_energy(k);
-        local_dE += new_e - eatom_cached[k];
-        changed_atoms.emplace_back(k, new_e);
+      if (split_cache_flag) {
+        // type-invariant sub-style energy is unchanged by a type swap; reuse cached value
+        int type_aware = 1 - invariant_substyle;
+        double sc_inv   = pace_substyles[invariant_substyle].second;
+        double sc_aware = pace_substyles[type_aware].second;
+        for (int k : affected) {
+          double new_eB = pace_substyles[type_aware].first->compute_atom_energy(k);
+          double new_e  = sc_inv * eatom_sA[k] + sc_aware * new_eB;
+          local_dE += new_e - eatom_cached[k];
+          changed_atoms.emplace_back(k, new_e);
+          changed_eB.push_back(new_eB);
+        }
+      } else {
+        for (int k : affected) {
+          double new_e = 0.0;
+          for (auto &[pace_s, scale_s] : pace_substyles)
+            new_e += scale_s * pace_s->compute_atom_energy(k);
+          local_dE += new_e - eatom_cached[k];
+          changed_atoms.emplace_back(k, new_e);
+        }
       }
     }
     double total_dE;
@@ -797,8 +842,13 @@ int FixAtomSwap::attempt_swap()
       }
     }
     // update per-atom energy cache with recomputed shell energies
-    if (local_energy_flag)
+    if (local_energy_flag) {
       for (auto &[idx, new_e] : changed_atoms) eatom_cached[idx] = new_e;
+      // split-cache: persist new type-aware energies; invariant sub-style (eatom_sA) is unchanged
+      if (split_cache_flag)
+        for (size_t ci = 0; ci < changed_atoms.size(); ci++)
+          eatom_sB[changed_atoms[ci].first] = changed_eB[ci];
+    }
     energy_stored = energy_after;
     return 1;
   }
@@ -898,6 +948,26 @@ double FixAtomSwap::build_eatom_cache()
   if (pace_substyles.size() == 1 && pace_substyles[0].second == 1.0) {
     // fast path: single PACE sub-style with unit scale
     local_sum = pace_substyles[0].first->build_atom_energy_cache(eatom_cached, eatom_cached_nmax);
+  } else if (split_cache_flag) {
+    // split-cache path: keep per-style unscaled caches for trial optimization
+    int type_aware = 1 - invariant_substyle;
+    if (nlocal > eatom_s_nmax) {
+      memory->destroy(eatom_sA);
+      memory->destroy(eatom_sB);
+      eatom_s_nmax = nlocal + 100;
+      memory->create(eatom_sA, eatom_s_nmax, "atom/swap:eatom_sA");
+      memory->create(eatom_sB, eatom_s_nmax, "atom/swap:eatom_sB");
+    }
+    for (int i = 0; i < nlocal; i++) { eatom_sA[i] = 0.0; eatom_sB[i] = 0.0; }
+    pace_substyles[invariant_substyle].first->accumulate_atom_energies(1.0, eatom_sA, eatom_s_nmax);
+    pace_substyles[type_aware].first->accumulate_atom_energies(1.0, eatom_sB, eatom_s_nmax);
+    double sc_inv   = pace_substyles[invariant_substyle].second;
+    double sc_aware = pace_substyles[type_aware].second;
+    local_sum = 0.0;
+    for (int i = 0; i < nlocal; i++) {
+      eatom_cached[i] = sc_inv * eatom_sA[i] + sc_aware * eatom_sB[i];
+      local_sum += eatom_cached[i];
+    }
   } else {
     // hybrid/scaled path: zero cache then accumulate each scaled sub-style
     for (int i = 0; i < nlocal; i++) eatom_cached[i] = 0.0;

@@ -59,6 +59,14 @@ class FixAtomSwap : public Fix {
   // sub-styles for localE with hybrid/scaled pace: (PairPACE*, scale)
   // for plain pace this has exactly one entry with scale=1.0
   std::vector<std::pair<class PairPACE *, double>> pace_substyles;
+
+  // split per-style cache: stores unscaled per-atom energies for each sub-style
+  // active when pace_substyles.size()==2 and one sub-style is type-invariant
+  int split_cache_flag;   // 1 = split cache active
+  int invariant_substyle; // index (0 or 1) of the type-invariant sub-style; -1 if none
+  double *eatom_sA;       // unscaled per-atom energies for sub-style indexed by invariant_substyle
+  double *eatom_sB;       // unscaled per-atom energies for the type-aware sub-style
+  int eatom_s_nmax;       // allocated length of eatom_sA / eatom_sB
   int niswap, njswap;                  // # of i,j swap atoms on all procs
   int niswap_local, njswap_local;      // # of swap atoms on this proc
   int niswap_before, njswap_before;    // # of swap atoms on procs < this proc

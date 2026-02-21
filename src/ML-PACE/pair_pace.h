@@ -63,6 +63,10 @@ class PairPACE : public Pair {
   void get_affected_local_atoms(tagint tag_i, tagint tag_j, std::vector<int> &affected);
   void accumulate_atom_energies(double scale, double *eatom, int nmax_eatom);
 
+  // returns true if swapping LAMMPS types t1 and t2 cannot change this sub-style's energy
+  // (i.e. both types map to the same ACE element index)
+  bool is_type_invariant(int t1, int t2) const { return map && (map[t1] == map[t2]); }
+
  protected:
   struct ACEImpl *aceimpl;
   int nmax_corerep;
