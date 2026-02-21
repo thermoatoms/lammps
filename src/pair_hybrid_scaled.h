@@ -30,6 +30,7 @@ namespace LAMMPS_NS {
 
 class PairHybridScaled : public PairHybrid {
  public:
+  friend class FixAtomSwap;
   PairHybridScaled(class LAMMPS *);
   ~PairHybridScaled() override;
   void compute(int, int) override;

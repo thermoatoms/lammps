@@ -59,6 +59,10 @@ class PairPACE : public Pair {
   double compute_shell_delta(tagint tag_i, tagint tag_j, const double *eatom_cached,
                              std::vector<std::pair<int, double>> &changed);
 
+  // helpers for hybrid/scaled support
+  void get_affected_local_atoms(tagint tag_i, tagint tag_j, std::vector<int> &affected);
+  void accumulate_atom_energies(double scale, double *eatom, int nmax_eatom);
+
  protected:
   struct ACEImpl *aceimpl;
   int nmax_corerep;
