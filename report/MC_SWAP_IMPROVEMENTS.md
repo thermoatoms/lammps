@@ -423,4 +423,72 @@ fix swap all atom/swap 100 100 12 800 ke no types 1 2 noforce yes
 
 # hybrid/scaled pace+pace — localE yes (all sub-styles must be pace)
 fix swap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
+
+# Alchemical TI: one type-invariant endpoint ("Au Au") + one type-aware ("Au Cu")
+# split-cache activates automatically when is_type_invariant() detects Au Au sub-style
+variable        lam equal ramp(0,1)    # changes every MD step
+pair_style      hybrid/scaled v_lam pace v_lam pace
+pair_coeff      * * pace 1 Au_endpoint.yace Au Au   # type-invariant sub-style
+pair_coeff      * * pace 2 AuCu.yace            Au Cu   # type-aware sub-style
+fix swap all atom/swap 1 10 12 800 ke no types 1 2 localE yes
 ```
+
+---
+
+## 5. Split Per-Style Cache for Alchemical TI (branch `split_cache`)
+
+### Motivation
+
+In alchemical TI workflows the coupling parameter λ is updated every MD timestep:
+
+```lammps
+variable        lam equal ramp(0,1)
+pair_style      hybrid/scaled v_lam pace v_lam pace
+pair_coeff      * * pace 1 Au_end.yace Au Au   # endpoint A — type-invariant
+pair_coeff      * * pace 2 AuCu.yace   Au Cu   # endpoint B — type-aware
+fix swap all atom/swap 1 10 12 800 ke no types 1 2 localE yes
+```
+
+Sub-style 1 maps **both** LAMMPS types to Au (`Au Au`), so the ACE energy of any atom is **independent of the LAMMPS type assignment**.  Swapping types 1↔2 cannot change that sub-style's per-atom energies.
+
+### Optimization
+
+During a trial swap the `localE` path re-evaluates ACE energies for ~2Z affected atoms with each sub-style.  For the type-invariant sub-style (`Au Au`), the "new" energy is identical to the cached value — recomputing it is wasted work.
+
+The split-cache stores per-style unscaled caches independently:
+
+| Array | Contents |
+|---|---|
+| `eatom_sA[i]` | Unscaled energy from the type-**invariant** sub-style |
+| `eatom_sB[i]` | Unscaled energy from the type-**aware** sub-style |
+| `eatom_cached[i]` | `sc_A * eatom_sA[i] + sc_B * eatom_sB[i]` (blended, used for accept/reject) |
+
+During a trial only `compute_atom_energy(k)` for the type-aware sub-style is called; `eatom_sA[k]` is reused directly.  On accept, only `eatom_sB` is updated.
+
+### Code Changes
+
+| Location | Change |
+|---|---|
+| `src/ML-PACE/pair_pace.h` | `is_type_invariant(t1, t2)` — returns true when `map[t1] == map[t2]` |
+| `src/MC/fix_atom_swap.h` | `split_cache_flag`, `invariant_substyle`, `eatom_sA`, `eatom_sB`, `eatom_s_nmax` |
+| `src/MC/fix_atom_swap.cpp` `FixAtomSwap()` | Initialise new members to zero/nullptr |
+| `src/MC/fix_atom_swap.cpp` `~FixAtomSwap()` | `memory->destroy(eatom_sA/sB)` |
+| `src/MC/fix_atom_swap.cpp` `init()` | After building `pace_substyles`: call `is_type_invariant`, set `split_cache_flag`; allocate `eatom_sA/sB` |
+| `src/MC/fix_atom_swap.cpp` `build_eatom_cache()` | New `split_cache_flag` branch fills both per-style arrays then blends |
+| `src/MC/fix_atom_swap.cpp` `attempt_swap()` | Skip `compute_atom_energy` for invariant sub-style; on accept update `eatom_sB` only |
+
+### Expected Speedup
+
+The saving occurs entirely in the trial–recompute phase.  At each MC step the cache rebuild is always a full recompute (positions change via MD), so the gain is proportional to `ncycles / N`:
+
+| `ncycles` | ACE evals saved per step | Approx overall speedup |
+|---|---|---|
+| 10 | ~50 % of trial evals | ~12 % |
+| 100 | ~50 % of trial evals | ~30 % |
+
+### Test
+
+`eam_test/run_splitcache_test.sh` verifies correctness via endpoint consistency:
+- λ=1 (`hybrid/scaled 1 0`, Au Au only): PE must match plain `pace Au Au` — **PASS, max |ΔPE| = 0 eV**
+- λ=0 (`hybrid/scaled 0 1`, Au Cu only): PE must match plain `pace Au Cu` — **PASS, max |ΔPE| = 0 eV**
+- λ=0.5 (split-cache fully active): finite PE, no crash — **PASS**
