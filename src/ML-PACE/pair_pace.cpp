@@ -298,43 +298,79 @@ double PairPACE::compute_shell_delta(tagint tag_i, tagint tag_j,
                                       std::vector<std::pair<int, double>> &changed)
 {
   changed.clear();
-  tagint *tag       = atom->tag;
-  int *numneigh     = list->numneigh;
-  int **firstneigh  = list->firstneigh;
 
   // resize ACE cache once for max neighbour count across all local atoms
   int max_jnum = 0;
   for (int ii = 0; ii < list->inum; ii++) {
     int i = list->ilist[ii];
-    if (numneigh[i] > max_jnum) max_jnum = numneigh[i];
+    if (list->numneigh[i] > max_jnum) max_jnum = list->numneigh[i];
   }
   if (max_jnum > 0) aceimpl->ace->resize_neighbours_cache(max_jnum);
 
+  std::vector<int> affected;
+  get_affected_local_atoms(tag_i, tag_j, affected);
+
   double local_dE = 0.0;
+  for (int k : affected) {
+    double new_e = compute_atom_energy(k);
+    local_dE += new_e - eatom_cached[k];
+    changed.emplace_back(k, new_e);
+  }
+  return local_dE;
+}
+
+/* ----------------------------------------------------------------------
+   find every local atom whose ACE energy is affected by swapping the atoms
+   with global tags tag_i and tag_j: i.e. an atom that IS one of the swapped
+   atoms, or has one of them in its neighbour list.
+   results are appended to 'affected' (caller should clear first if needed).
+------------------------------------------------------------------------- */
+
+void PairPACE::get_affected_local_atoms(tagint tag_i, tagint tag_j,
+                                         std::vector<int> &affected)
+{
+  affected.clear();
+  tagint *tag      = atom->tag;
+  int *numneigh    = list->numneigh;
+  int **firstneigh = list->firstneigh;
+
   for (int ii = 0; ii < list->inum; ii++) {
     int k = list->ilist[ii];
-
-    // atom k is affected if it IS a swapped atom or has one in its neighbour list
-    bool affected = (tag[k] == tag_i || tag[k] == tag_j);
-    if (!affected) {
-      int jnum    = numneigh[k];
+    bool is_affected = (tag[k] == tag_i || tag[k] == tag_j);
+    if (!is_affected) {
       int *jlist_k = firstneigh[k];
-      for (int jj = 0; jj < jnum; jj++) {
+      for (int jj = 0; jj < numneigh[k]; jj++) {
         tagint jtag = tag[jlist_k[jj] & NEIGHMASK];
         if (jtag == tag_i || jtag == tag_j) {
-          affected = true;
+          is_affected = true;
           break;
         }
       }
     }
-
-    if (affected) {
-      double new_e = compute_atom_energy(k);
-      local_dE += new_e - eatom_cached[k];
-      changed.emplace_back(k, new_e);
-    }
+    if (is_affected) affected.push_back(k);
   }
-  return local_dE;
+}
+
+/* ----------------------------------------------------------------------
+   add scale * e_atom to eatom[local_index] for every atom in the neighbour
+   list.  caller must zero eatom[] before the first call when accumulating
+   contributions from multiple sub-styles.
+------------------------------------------------------------------------- */
+
+void PairPACE::accumulate_atom_energies(double scale, double *eatom, int /*nmax_eatom*/)
+{
+  // size ACE neighbour cache once for the largest neighbour list on this rank
+  int max_jnum = 0;
+  for (int ii = 0; ii < list->inum; ii++) {
+    int i = list->ilist[ii];
+    if (list->numneigh[i] > max_jnum) max_jnum = list->numneigh[i];
+  }
+  if (max_jnum > 0) aceimpl->ace->resize_neighbours_cache(max_jnum);
+
+  for (int ii = 0; ii < list->inum; ii++) {
+    int i = list->ilist[ii];
+    eatom[i] += scale * compute_atom_energy(i);
+  }
 }
 
 /* ---------------------------------------------------------------------- */

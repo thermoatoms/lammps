@@ -1,0 +1,43 @@
+# hybrid/scaled pace+pace test
+# Two copies of the same PACE potential each scaled by 0.5
+# => total energy identical to a single unscaled PACE run (sanity check)
+#
+# Usage:
+#   lmp -var lambda 0.5 -var swap_kw "localE yes" -in lmp_hybrid_scaled.in
+#   lmp -var lambda 0.5 -var swap_kw "noforce yes" -in lmp_hybrid_scaled.in
+#
+# swap_kw is substituted verbatim into the fix atom/swap command.
+
+units           metal
+atom_style      atomic
+boundary        p p p
+
+lattice         fcc 4.08
+region          box block 0 5 0 5 0 5
+create_box      2 box
+create_atoms    1 box
+
+set             type 1 type/fraction 2 0.5 12345
+
+mass            1 196.97
+mass            2 63.55
+
+variable        flambda equal v_lambda
+variable        blambda equal v_lambda
+
+pair_style      hybrid/scaled v_flambda pace v_blambda pace
+pair_coeff      * * pace 1 AuCu_LDA.yace Au Cu
+pair_coeff      * * pace 2 AuCu_LDA.yace Au Cu
+
+compute         c1 all pair pace 1
+compute         c2 all pair pace 2
+
+velocity        all create 800.0 42 mom yes rot yes dist gaussian
+fix             nvt all nvt temp 800 800 0.1
+
+fix             swap all atom/swap 1 10 12 800 ke no types 1 2 ${swap_kw}
+
+thermo          10
+thermo_style    custom step pe temp c_c1 c_c2
+
+run             100

@@ -37,6 +37,7 @@
 #include "neighbor.h"
 #include "pair.h"
 #include "pair_hybrid.h"
+#include "pair_hybrid_scaled.h"
 #include "pair_pace.h"
 #include "random_park.h"
 #include "region.h"
@@ -415,7 +416,7 @@ void FixAtomSwap::init()
         if (cutsq[type_list[iswaptype]][ktype] != cutsq[type_list[jswaptype]][ktype])
           unequal_cutoffs = true;
 
-  // localE validation: PACE-only, single-swap, equal cutoffs
+  // localE validation: PACE (plain or hybrid/scaled all-PACE), single-swap, equal cutoffs
   if (local_energy_flag) {
     if (nswap_count > 1)
       error->all(FLERR, Error::NOLASTLINE,
@@ -423,12 +424,29 @@ void FixAtomSwap::init()
     if (semi_grand_flag)
       error->all(FLERR, Error::NOLASTLINE,
                  "Fix atom/swap localE is not compatible with semi-grand");
-    if (!utils::strmatch(force->pair_style, "^pace"))
-      error->all(FLERR, Error::NOLASTLINE,
-                 "Fix atom/swap localE requires pair style pace");
     if (unequal_cutoffs)
       error->all(FLERR, Error::NOLASTLINE,
                  "Fix atom/swap localE is not compatible with unequal type cutoffs");
+
+    // populate pace_substyles: allows plain 'pace' or 'hybrid/scaled' with all-PACE sub-styles
+    pace_substyles.clear();
+    auto *hybrid_sc = dynamic_cast<PairHybridScaled *>(force->pair);
+    if (hybrid_sc) {
+      for (int s = 0; s < hybrid_sc->nstyles; s++) {
+        auto *pace_s = dynamic_cast<PairPACE *>(hybrid_sc->styles[s]);
+        if (!pace_s)
+          error->all(FLERR, Error::NOLASTLINE,
+                     "Fix atom/swap localE with hybrid/scaled requires all sub-styles to be pace");
+        pace_substyles.emplace_back(pace_s, hybrid_sc->scaleval[s]);
+      }
+    } else {
+      auto *pace = dynamic_cast<PairPACE *>(force->pair);
+      if (!pace)
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Fix atom/swap localE requires pair style pace or hybrid/scaled pace ...");
+      pace_substyles.emplace_back(pace, 1.0);
+    }
+
     // pre-allocate the per-atom energy cache
     if (atom->nlocal > eatom_cached_nmax) {
       memory->destroy(eatom_cached);
@@ -722,9 +740,25 @@ int FixAtomSwap::attempt_swap()
   std::vector<std::pair<int, double>> changed_atoms;
 
   if (local_energy_flag) {
-    auto *pace = dynamic_cast<PairPACE *>(force->pair);
-    double local_dE = pace->compute_shell_delta(tag_i_global, tag_j_global,
-                                                eatom_cached, changed_atoms);
+    double local_dE;
+    if (pace_substyles.size() == 1 && pace_substyles[0].second == 1.0) {
+      // fast path: single PACE, use compute_shell_delta directly
+      local_dE = pace_substyles[0].first->compute_shell_delta(tag_i_global, tag_j_global,
+                                                               eatom_cached, changed_atoms);
+    } else {
+      // hybrid/scaled path: find affected atoms via first sub-style's neighbour list
+      // (equal cutoffs are enforced in init()), then sum scaled contributions
+      std::vector<int> affected;
+      pace_substyles[0].first->get_affected_local_atoms(tag_i_global, tag_j_global, affected);
+      local_dE = 0.0;
+      for (int k : affected) {
+        double new_e = 0.0;
+        for (auto &[pace_s, scale_s] : pace_substyles)
+          new_e += scale_s * pace_s->compute_atom_energy(k);
+        local_dE += new_e - eatom_cached[k];
+        changed_atoms.emplace_back(k, new_e);
+      }
+    }
     double total_dE;
     MPI_Allreduce(&local_dE, &total_dE, 1, MPI_DOUBLE, MPI_SUM, world);
     energy_after = energy_stored + total_dE;
@@ -806,9 +840,23 @@ double FixAtomSwap::energy_full()
 
   if (modify->n_pre_force) modify->pre_force(vflag);
 
-  if (noforce_flag && force->pair) force->pair->energy_only = 1;
+  if (noforce_flag && force->pair) {
+    auto *hybrid = dynamic_cast<PairHybrid *>(force->pair);
+    if (hybrid) {
+      for (int s = 0; s < hybrid->nstyles; s++) hybrid->styles[s]->energy_only = 1;
+    } else {
+      force->pair->energy_only = 1;
+    }
+  }
   if (force->pair) force->pair->compute(eflag, vflag);
-  if (noforce_flag && force->pair) force->pair->energy_only = 0;
+  if (noforce_flag && force->pair) {
+    auto *hybrid = dynamic_cast<PairHybrid *>(force->pair);
+    if (hybrid) {
+      for (int s = 0; s < hybrid->nstyles; s++) hybrid->styles[s]->energy_only = 0;
+    } else {
+      force->pair->energy_only = 0;
+    }
+  }
 
   if (atom->molecular != Atom::ATOMIC) {
     if (force->bond) force->bond->compute(eflag, vflag);
@@ -832,8 +880,6 @@ double FixAtomSwap::energy_full()
 
 double FixAtomSwap::build_eatom_cache()
 {
-  auto *pace = dynamic_cast<PairPACE *>(force->pair);
-
   // grow array if nlocal has increased since last allocation
   int nlocal = atom->nlocal;
   if (nlocal > eatom_cached_nmax) {
@@ -842,7 +888,25 @@ double FixAtomSwap::build_eatom_cache()
     memory->create(eatom_cached, eatom_cached_nmax, "atom/swap:eatom_cached");
   }
 
-  double local_sum = pace->build_atom_energy_cache(eatom_cached, eatom_cached_nmax);
+  // refresh scale factors in case hybrid/scaled uses variable-based scales
+  auto *hybrid_sc = dynamic_cast<PairHybridScaled *>(force->pair);
+  if (hybrid_sc)
+    for (size_t s = 0; s < pace_substyles.size(); s++)
+      pace_substyles[s].second = hybrid_sc->scaleval[s];
+
+  double local_sum;
+  if (pace_substyles.size() == 1 && pace_substyles[0].second == 1.0) {
+    // fast path: single PACE sub-style with unit scale
+    local_sum = pace_substyles[0].first->build_atom_energy_cache(eatom_cached, eatom_cached_nmax);
+  } else {
+    // hybrid/scaled path: zero cache then accumulate each scaled sub-style
+    for (int i = 0; i < nlocal; i++) eatom_cached[i] = 0.0;
+    for (auto &[pace_s, scale_s] : pace_substyles)
+      pace_s->accumulate_atom_energies(scale_s, eatom_cached, eatom_cached_nmax);
+    local_sum = 0.0;
+    for (int i = 0; i < nlocal; i++) local_sum += eatom_cached[i];
+  }
+
   double global_sum;
   MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, world);
   return global_sum;

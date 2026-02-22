@@ -24,6 +24,7 @@ FixStyle(atom/swap,FixAtomSwap);
 
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace LAMMPS_NS {
 
@@ -55,6 +56,9 @@ class FixAtomSwap : public Fix {
   int local_energy_flag;       // 1 = use local shell energy (PACE only, nswap_count=1)
   double *eatom_cached;        // cached per-local-atom ACE energies
   int eatom_cached_nmax;       // allocated size of eatom_cached
+  // sub-styles for localE with hybrid/scaled pace: (PairPACE*, scale)
+  // for plain pace this has exactly one entry with scale=1.0
+  std::vector<std::pair<class PairPACE *, double>> pace_substyles;
   int niswap, njswap;                  // # of i,j swap atoms on all procs
   int niswap_local, njswap_local;      // # of swap atoms on this proc
   int niswap_before, njswap_before;    // # of swap atoms on procs < this proc
