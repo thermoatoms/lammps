@@ -436,22 +436,33 @@ void FixAtomSwap::init()
                  "Fix atom/swap localE is not compatible with unequal type cutoffs");
 
     // populate pace_substyles: allows plain 'pace' or 'hybrid/scaled' with all-PACE sub-styles
+    // for non-PACE pair styles (e.g. GRACE), localE is silently ignored
     pace_substyles.clear();
+    bool is_pace_style = false;
     auto *hybrid_sc = dynamic_cast<PairHybridScaled *>(force->pair);
     if (hybrid_sc) {
+      bool all_pace = true;
       for (int s = 0; s < hybrid_sc->nstyles; s++) {
         auto *pace_s = dynamic_cast<PairPACE *>(hybrid_sc->styles[s]);
-        if (!pace_s)
-          error->all(FLERR, Error::NOLASTLINE,
-                     "Fix atom/swap localE with hybrid/scaled requires all sub-styles to be pace");
+        if (!pace_s) { all_pace = false; break; }
         pace_substyles.emplace_back(pace_s, hybrid_sc->scaleval[s]);
       }
+      is_pace_style = all_pace;
+      if (!is_pace_style) pace_substyles.clear();
     } else {
       auto *pace = dynamic_cast<PairPACE *>(force->pair);
-      if (!pace)
-        error->all(FLERR, Error::NOLASTLINE,
-                   "Fix atom/swap localE requires pair style pace or hybrid/scaled pace ...");
-      pace_substyles.emplace_back(pace, 1.0);
+      if (pace) {
+        pace_substyles.emplace_back(pace, 1.0);
+        is_pace_style = true;
+      }
+    }
+
+    if (!is_pace_style) {
+      // non-PACE pair style (e.g. GRACE): silently disable localE optimization
+      if (comm->me == 0)
+        utils::logmesg(lmp, "Fix atom/swap localE: pair style is not pace, "
+                            "localE optimization disabled (no-op)\n");
+      local_energy_flag = 0;
     }
 
     // pre-allocate the per-atom energy cache

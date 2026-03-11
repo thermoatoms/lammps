@@ -133,6 +133,19 @@
 /pair_pace.h
 /pair_pace_extrapolation.cpp
 /pair_pace_extrapolation.h
+/pair_grace.cpp
+/pair_grace.h
+/pair_grace_1layer_chunk.cpp
+/pair_grace_1layer_chunk.h
+/pair_grace_2layer_chunk.cpp
+/pair_grace_2layer_chunk.h
+/pair_grace_2layer_parallel.cpp
+/pair_grace_2layer_parallel.h
+/pair_grace_fs.cpp
+/pair_grace_fs.h
+/utils_grace.cpp
+/utils_grace.h
+/utils_pace.h
 
 /atom_vec_apip.cpp
 /atom_vec_apip.h

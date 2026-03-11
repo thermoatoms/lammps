@@ -1,6 +1,6 @@
 # MC Swap Performance Improvements — Technical Report
 
-**Branch:** `thermoatoms/lammps` → `energy_eval`  
+**LAMMPS fork:** `thermoatoms/lammps`  
 **ACE fork:** `thermoatoms/lammps-user-pace` → `main` (commit `ecfc160`)  
 **Build identifier:** `LAMMPS (11 Feb 2026 - Development-MCnoforce-localE)`
 
@@ -26,15 +26,14 @@ Three improvements were implemented, in order of increasing speedup.
 **Keyword:** `noforce yes`  
 **Default:** `noforce no`
 
-### The problem
+### Physical basis
 
 The standard `force->pair->compute(eflag, vflag)` call computes both energy and forces.
 During an MC trial, forces are irrelevant — only the scalar potential energy matters.
 For ACE/PACE potentials, the force loop (back-propagation through the ACE basis
-gradients to produce `neighbours_forces`) is computationally expensive and dominates
-runtime. Computing it twice per MC trial — only to discard the result — is pure waste.
+gradients to produce `neighbours_forces`) is computationally expensive. 
 
-### LAMMPS-side change (`pair.h`, `pair.cpp`)
+### LAMMPS implementation (`pair.h`, `pair.cpp`)
 
 A new integer flag `energy_only` was added to the `Pair` base class (initialized to 0).
 When set to 1 by the fix before calling `compute()`, individual pair styles can inspect
@@ -54,22 +53,6 @@ if (noforce_flag && force->pair) force->pair->energy_only = 0;
 
 The flag is always restored to 0 after the call so normal MD force steps are unaffected.
 
-### EAM implementation (`pair_eam.cpp`)
-
-The EAM inner loop was restructured to compute the pair energy $\phi(r)$ unconditionally
-but guard the force derivative terms ($\phi'$, $F'$ embedding derivatives, `f[i]`
-accumulation) behind `if (!energy_only)`:
-
-```cpp
-phi = z2 * recip;
-if (eflag) evdwl = scale[itype][jtype] * phi;
-if (!energy_only) {
-    phip = z2p*recip - phi*recip;
-    psip = fp[i]*rhojp + fp[j]*rhoip + phip;
-    fpair = -scale[itype][jtype] * psip * recip;
-    f[i][0] += delx*fpair;  // ...
-} else fpair = 0.0;
-```
 
 ### ACE/PACE implementation — changes to the ACE fork
 
@@ -119,22 +102,15 @@ aceimpl->ace->compute_atom(i, x, type, jnum, jlist);
 The force accumulation loop on the LAMMPS side (reading back `neighbours_forces` and
 applying to `f[i]`, `f[j]`) was also guarded with `if (!energy_only)`.
 
-### Validated
+### Validation
 
 Bit-identical energy trajectory and accept/reject sequence (same random seed) with and
-without `noforce yes`. EAM MC loop time: −20% at 500 atoms. HPC benchmarks at 4000 atoms
-with the Au-Cu PACE potential show a substantially larger speedup: the PACE force
-back-propagation loop dominates the per-evaluation cost, so skipping it yields a
-measured **~2–3× speedup** in MC-loop wall time for `noforce yes` relative to the
-unmodified fix. The speedup is independent of system size because it targets the
+without `noforce yes`. HPC benchmarks at 4000 atoms with the Au-Cu PACE potential show a substantially larger speedup. The speedup is independent of system size because it targets the
 per-atom cost, not the total atom count.
 
 ![Figure 1](fig_speedup_force_opt.png)
 
-*Figure 1. MC-loop wall-time speedup for `noforce yes` relative to the unmodified baseline.
-Benchmarked on 4000-atom Au-Cu at 800 K using the PACE potential on the HPC cluster.
-The speedup is predominantly per-atom (independent of system size) and reflects the cost of
-skipping the ACE force back-propagation loop during MC energy evaluations.*
+*Figure 1. (Left) The energy per atom during the MCMD run with the base code and the no force optimisation. (Right) The speedup when using the no-force approach on 40 cores with 4000 atoms. The speedup is even more significant on lesser cores.*
 
 ---
 
@@ -143,7 +119,7 @@ skipping the ACE force back-propagation loop during MC energy evaluations.*
 **Keyword:** `swap_count N`  
 **Default:** `swap_count 1` (original behaviour preserved)
 
-### What it does
+### Physical basis
 
 The original fix swaps exactly one pair of atoms per MC trial. The new `swap_count N`
 keyword selects $N$ pairs simultaneously, swaps all of them atomically, evaluates the
@@ -151,7 +127,7 @@ total energy change, and accepts or rejects the entire move as a single Metropol
 This is a standard extension of the MC algorithm that increases the configurational
 sampling rate without changing the number of energy evaluations per cycle.
 
-### Implementation
+### LAMMPS implementation
 
 Changes are confined to `src/MC/fix_atom_swap.cpp/.h`. The `attempt_swap()` function
 was extended to select `nswap_count` distinct atoms from each type list using the same
@@ -159,21 +135,13 @@ was extended to select `nswap_count` distinct atoms from each type list using th
 restore all of them atomically. The Metropolis criterion is applied to the total
 $\Delta E$ over all $N$ pairs.
 
-### Validated
+### Validation
 
-91/2000 accepted swaps at `swap_count 3` on a 500-atom Cu-Au EAM system at 800 K.
-HPC benchmarks at 4000 atoms with the Au-Cu PACE potential confirm that the accept/reject
-statistics are well-behaved across `swap_count 1`–`4`; higher counts increase the average
-$|\Delta E|$ per trial and reduce the acceptance rate, but the sampling efficiency
-(accepted swaps per unit wall time) improves because each trial gives a larger
-configurational displacement.
+Higher counts increase the average $|\Delta E|$ per trial and reduce the acceptance rate. Swapping more atoms in this system leads to lower acceptance.
 
 ![Figure 2](fig_swap_more_atoms.png)
 
-*Figure 2. Acceptance rate and sampling efficiency (accepted swaps per unit wall time) as a
-function of `swap_count` (1–4). Benchmarked on 4000-atom Au-Cu at 800 K using the PACE potential
-on the HPC cluster. Higher `swap_count` reduces the per-move acceptance probability but increases
-the configurational displacement per accepted move, yielding higher net sampling throughput.*
+*Figure 2. (Left) Energy per atom of the system with simulation time for varying number of concurrent swaps. (Right) Acceptance rate and sampling efficiency (accepted swaps per unit wall time) as a function of `swap_count` (1–4).*
 
 ---
 
@@ -183,189 +151,117 @@ the configurational displacement per accepted move, yielding higher net sampling
 **Default:** `localE no`  
 **Requires:** `pair_style pace`, `swap_count 1`, `semi-grand no`
 
-### The physics basis
+### Physical basis
 
 In the ACE formalism, the total potential energy is written as a sum of per-atom
 contributions:
 
 $$E_{\text{tot}} = \sum_{i=1}^{N} \varepsilon_i$$
 
-where $\varepsilon_i = F_{\mu_i}(\{\rho_p^{(i)}\}) + E_0(\mu_i)$ depends only on the
-chemical species of atom $i$ and the positions and species of its neighbours within the
-cutoff radius $r_c$. Crucially, there is **no explicit pairwise energy splitting** — the
-full many-body energy of atom $i$'s environment is assigned entirely to atom $i$. This
-is the key property that makes local energy approximation exact within ACE.
+where $\varepsilon_i = F_{\mu_i}(\{\rho_p^{(i)}\}) + E_0(\mu_i)$ depends only on the chemical species of atom $i$ and the positions and species of its neighbours within the cutoff radius $r_c$. Crucially, there is no explicit pairwise energy splitting — the full many-body energy of atom $i$'s environment is assigned entirely to atom $i$. This is the key property that makes local energy approximation exact within ACE.
 
 When atom $i$ is swapped from species $\mu_i$ to $\mu_j$:
 
 $$\Delta E = \underbrace{\Delta \varepsilon_i}_{\text{species change at }i}
            + \sum_{k \in \mathcal{N}(i)} \underbrace{\Delta \varepsilon_k}_{i\text{ appears as neighbour of }k}$$
 
-where $\mathcal{N}(i)$ is the set of all atoms that have $i$ within their own cutoff
-(for ACE's full neighbour list this is the same as $i$'s neighbour list under symmetric
-cutoffs). The rest of the system is **exactly unaffected**. For a typical metal with
-$r_c \approx 5$ Å, $|\mathcal{N}(i)| \approx 50$–80. This means $\Delta E$ can be
-computed by rerunning `compute_atom` on ~100 atoms rather than all $N$.
+where $\mathcal{N}(i)$ is the set of all atoms that have $i$ within their own cutoff (for ACE's full neighbour list this is the same as $i$'s neighbour list under symmetric cutoffs). The rest of the system remains unaffected. For a typical metal with $r_c \approx 5$ Å, $|\mathcal{N}(i)| \approx 50$–80. This means $\Delta E$ can be computed by rerunning `compute_atom` on ~100 atoms rather than all $N$.
 
-### New methods in `PairPACE`
+### PACE implementation
 
 Three public helper methods were added to `pair_pace.h/.cpp`:
 
-**`compute_atom_energy(i)`** — calls `compute_atom` on a single atom with
-`energy_only = true`, returns the scaled `e_atom`. Reuses the existing neighbour list
-without any rebuild.
+**`compute_atom_energy(i)`** — calls `compute_atom` on a single atom with `energy_only = true`, returns the scaled `e_atom`. Reuses the existing neighbour list without any rebuild.
 
-**`build_atom_energy_cache(eatom[], nmax)`** — iterates over all local atoms, calls
-`compute_atom_energy(k)` for each, fills the cache array, and returns the local energy
-sum. Called once per `pre_exchange()` after reneighboring.
+**`build_atom_energy_cache(eatom[], nmax)`** — iterates over all local atoms, calls `compute_atom_energy(k)` for each, fills the cache array, and returns the local energy sum. Called once per `pre_exchange()` after reneighboring.
 
-**`compute_shell_delta(tag_i, tag_j, eatom_cached[], changed)`** — the core of the
-local energy path. After a type swap (types already updated, ghosts synced via
-`comm->forward_comm`), scans all local atoms: an atom $k$ is included in the affected
-set if `tag[k] == tag_i`, `tag[k] == tag_j`, or atom `tag_i`/`tag_j` appears in $k$'s
-neighbour list. For each affected $k$: recomputes `e_atom`, accumulates
-`local_dE += new_e - eatom_cached[k]`, records `(k, new_e)` for cache update on
-accept. Returns the local $\Delta E$ contribution; caller does one `MPI_Allreduce`.
+**`compute_shell_delta(tag_i, tag_j, eatom_cached[], changed)`** — the core of the local energy path. After a type swap (types already updated, ghosts synced via `comm->forward_comm`), scans all local atoms: an atom $k$ is included in the affected set if `tag[k] == tag_i`, `tag[k] == tag_j`, or atom `tag_i`/`tag_j` appears in $k$'s neighbour list. For each affected $k$: recomputes `e_atom`, accumulates `local_dE += new_e - eatom_cached[k]`, records `(k, new_e)` for cache update on accept. Returns the local $\Delta E$ contribution; caller does one `MPI_Allreduce`.
 
-### Integration into `fix_atom_swap`
+### LAMMPS implementation
 
 **Cache management:**
 - `eatom_cached[]` is allocated at `init()` time and grown as needed.
-- `build_eatom_cache()` in the fix calls `pace->build_atom_energy_cache()` then
-  `MPI_Allreduce` for the global sum, replacing `energy_full()` at the top of
-  `pre_exchange()`.
+- `build_eatom_cache()` in the fix calls `pace->build_atom_energy_cache()` then `MPI_Allreduce` for the global sum, replacing `energy_full()` at the top of `pre_exchange()`.
 
 **Per-trial path in `attempt_swap()`:**
 1. Swap types on owning ranks
 2. `comm->forward_comm(this)` — ghost types updated on all ranks
-3. Tag broadcast: `MPI_Allreduce` of `{tag[i], tag[j]}` so all ranks know which two
-   global atoms were swapped
+3. Tag broadcast: `MPI_Allreduce` of `{tag[i], tag[j]}` so all ranks know which two global atoms were swapped
 4. `pace->compute_shell_delta(...)` — returns local $\Delta E$
 5. `MPI_Allreduce` → global $\Delta E$, Metropolis test
 6. Accept: update `eatom_cached` for affected atoms, `energy_stored += delta`
 7. Reject: restore types, one `forward_comm` to re-sync ghosts
 
-The total MPI traffic per trial is two tag integers broadcast plus one double reduce —
-replacing the expensive global pair compute and its PE reduction with a trivial local
-scan of ~100 atoms.
+The total MPI traffic per trial is two tag integers broadcast plus one double reduce replacing the expensive global pair compute and its PE reduction with a trivial local scan of ~100 atoms.
 
-### Scaling analysis
+### Validation
 
-| Method | Operations per trial | MPI per trial |
-|---|---|---|
-| Full `energy_full()` | $O(N \cdot Z)$ ACE evaluations | 1 global PE reduce |
-| `noforce yes` | $O(N \cdot Z)$ energy-only evals | 1 global PE reduce |
-| `localE yes` | $O(Z^2)$ energy-only on ~$2Z$ atoms | 1 `Allreduce`($\Delta E$) + 1 `forward_comm` |
-
-For a 4000-atom system with $Z \approx 60$: approximately $4000 / (2 \times 60) \approx
-33\times$ fewer ACE evaluations per trial. Combined with `energy_only` mode (no force
-back-propagation per atom), the effective speedup over the original `energy_full()` is
-expected to be **50–200×** depending on the ACE basis size.
-
-### Validated
-
-Bit-identical PE trajectory and accept/reject sequence at all 100 MD steps vs
-`noforce yes` baseline (same seed, 500-atom Au-Cu PACE system at 800 K).  
-Wall time: **14 s → 8 s at 500 atoms.**
-
-HPC benchmarks at 4000 atoms with the Au-Cu PACE potential confirm that the acceptance
-rate is unchanged relative to the full-system reference, demonstrating that the local
-approximation is **exact** for ACE (no bias introduced):
+HPC benchmarks at 4000 atoms with the Au-Cu PACE potential confirm that the acceptance rate is unchanged relative to the full-system reference, demonstrating that the local approximation is **exact** for ACE (no bias introduced):
 
 ![Figure 3](fig_localE_acceptance.png)
 
-*Figure 3. MC acceptance rate for `localE yes` compared to the full-system reference
-(`noforce yes`) over 2000 trial moves. Benchmarked on 4000-atom Au-Cu at 800 K using the PACE
-potential on the HPC cluster. The distributions are bit-identical, confirming that the local
-coordination-shell approximation introduces no bias for ACE potentials.*
+*Figure 3. (Left) Energy per atom with simulation time for base and optimised methods (Right) MC acceptance rate for `localE yes` compared to the full-system reference (`noforce yes`). Benchmarked on 4000-atom Au-Cu at 800 K using the PACE potential on the HPC cluster. The distributions are bit-identical, confirming that the local coordination-shell approximation introduces no bias for ACE potentials.*
 
 The wall-time speedup at 4000 atoms scales as predicted — approximately linear in $N$
 relative to `noforce yes`, confirming the $O(Z^2)$ vs $O(N \cdot Z)$ cost reduction:
 
 ![Figure 4](fig_localE_speedup.png)
 
-*Figure 4. Wall-time speedup of `localE yes` relative to both `noforce yes` and the unmodified
-baseline. Benchmarked on 4000-atom Au-Cu at 800 K using the PACE potential on the HPC cluster.
-The approximately linear scaling with $N$ is consistent with the theoretical $O(Z^2)$ vs
-$O(N \cdot Z)$ cost reduction, where $Z \approx 60$ is the mean coordination number.*
+*Figure 4. (Left) Wall-time speedup of `localE yes` relative to both `noforce yes` and the unmodified baseline. (Right) Scaling with number of cores for base and optimised methods. There is a slight overhead due to communication for the optimised method.*
 
 ---
 
-## Extension: `pair_style hybrid/scaled` Support
+## Improvement 4: Improved `pair_style hybrid/scaled` (PACE + PACE)
 
-All three keywords are now compatible with `pair_style hybrid/scaled` when every
-sub-style is `pace`. The motivating use case is free-energy perturbation (FEP) or
-thermodynamic integration (TI) where two ACE potentials are blended by a coupling
-parameter $\lambda$:
+### Physical basis
+
+Alchemical free energy calculations in calphy use `pair_style hybrid/scaled` with two PACE sub-styles scaled by complementary λ-dependent variables:
 
 ```lammps
-variable        flambda  equal  v_lambda
-variable        blambda  equal  1.0-v_lambda
-
-pair_style      hybrid/scaled v_flambda pace v_blambda pace
-pair_coeff      * * pace 1 potential_A.yace Au Cu
-pair_coeff      * * pace 2 potential_B.yace Au Cu
+pair_style  hybrid/scaled v_flambda pace v_blambda pace
+pair_coeff  * * pace 1 AuCu.yace Au Au
+pair_coeff  * * pace 2 AuCu.yace Au Cu
 ```
 
-The total energy seen by the MC criterion is $E = \lambda\, E_A + (1-\lambda)\, E_B$,
-updated continuously as `v_lambda` changes.
+This setup continuously morphs the interatomic potential from one chemical state to another as λ varies from 0 to 1. MC atom swaps must remain efficient across the full λ path.
 
-### Issues fixed
+The total scaled energy is:
 
-**`noforce yes` was a silent no-op with any hybrid style.** `energy_full()` previously
-set `energy_only = 1` only on the `PairHybrid` wrapper object. `PairHybrid::compute()`
-calls each sub-style's own `compute()`, and those sub-style objects have their own
-independent `energy_only = 0`, so the flag had no effect. The fix walks
-`hybrid->styles[]` and propagates the flag to every sub-style before and after the
-call. This applies to all hybrid types, not just `hybrid/scaled`.
+$$E_{\text{tot}} = \lambda \sum_i \varepsilon_i^{(A)} + (1-\lambda) \sum_i \varepsilon_i^{(B)}$$
 
-**`localE yes` was blocked and would have silently given wrong results with hybrid.**
-Two problems existed: (1) the `init()` check used `utils::strmatch("^pace")` which
-never matches `"hybrid/scaled ..."`, producing an immediate error; (2) `build_eatom_cache()`
-and `attempt_swap()` both called `dynamic_cast<PairPACE*>(force->pair)` which returns
-null for a hybrid wrapper. Both are now resolved as described below.
+Three new public helpers were added to `PairPACE`:
 
-### Implementation
+- **`get_affected_local_atoms(tag_i, tag_j, affected)`** — extracts the coordination-shell scan into a reusable primitive shared across all code paths
+- **`accumulate_atom_energies(scale, eatom[], nmax)`** — adds `scale × e_atom` into an existing cache array, enabling multi-style accumulation without a temporary buffer
+- **`is_type_invariant(t1, t2)`** — returns true when both LAMMPS types map to the same ACE species index; used to detect the type-invariant sub-style at `init()` time
 
-**New `PairPACE` helpers** (`pair_pace.h`, `pair_pace.cpp`):
+A new member `pace_substyles` (`std::vector<std::pair<PairPACE*, double>>`) is populated at `init()` for both the plain-PACE and hybrid paths, so all downstream code (`build_eatom_cache`, `attempt_swap`, `compute_shell_delta`) uses a single unified loop with no special-casing.
 
-- `get_affected_local_atoms(tag_i, tag_j, affected)` — extracts the coordination-shell
-  scan (previously embedded in `compute_shell_delta`) into a reusable public method,
-  so the fix can identify the affected set once and query multiple sub-styles.
-- `accumulate_atom_energies(scale, eatom[], nmax)` — adds `scale * e_atom` to an
-  existing cache array without zeroing it first, enabling multi-style accumulation.
+When `is_type_invariant` detects that one sub-style maps both LAMMPS atom types to the same ACE species (the typical alchemical endpoint sub-style, e.g. `Au Au`), the fix maintains two independent per-style energy caches `eatom_sA[]` and `eatom_sB[]` instead of a single blended cache. The blended `eatom_cached[i]` is then:
 
-**`pace_substyles` member in `FixAtomSwap`** — a `std::vector<std::pair<PairPACE*, double>>`
-populated at `init()` time:
-- plain `pace`: one entry `{pace, 1.0}`
-- `hybrid/scaled pace ...`: one entry per sub-style `{styles[s], scaleval[s]}`; errors
-  immediately if any sub-style is not `PairPACE`
+```
+eatom_cached[i] = scale_A * eatom_sA[i] + scale_B * eatom_sB[i]
+```
 
-All downstream code (`build_eatom_cache`, `attempt_swap`) iterates `pace_substyles`
-instead of casting `force->pair` directly, eliminating all run-time `dynamic_cast` calls
-during the MC loop.
+The key benefit: swapping two atoms cannot change `eatom_sA[i]` for the type-invariant sub-style (the ACE species assignment is identical for both LAMMPS types). The `attempt_swap` trial therefore calls `compute_atom_energy` only for the type-sensitive sub-style on the ~2Z affected atoms, and skips the invariant sub-style entirely. On acceptance, only `eatom_sB` is updated.
 
-The **fast single-PACE path** (size == 1, scale == 1.0) is preserved as a special case,
-so existing single-PACE simulations have zero overhead from this change.
 
-The `scaleval[]` array is re-read at the start of each `build_eatom_cache()` call so
-that LAMMPS variable-driven scale factors (e.g. a `v_lambda` that changes during a
-run) are always current.
+**`noforce yes` propagation through hybrid**
 
-### Validated
+When `noforce yes` is active, `energy_full()` now walks all `hybrid->styles[]` and sets
+`energy_only = 1` on each sub-style's `Pair` object before calling `compute()`, then
+restores them afterwards. This ensures the force-loop skip operates on both PACE
+sub-styles simultaneously, giving the same ~2–3× MC timer reduction measured for the
+single-PACE case.
 
-Sanity check: two copies of the same `AuCu_LDA.yace` potential each scaled by 0.5
-must reproduce the single-PACE energies exactly.
+### Validation
 
-**Test 1 — `noforce yes` energy parity (REF vs HS_NF):** single `pace noforce yes`
-vs `hybrid/scaled 0.5+0.5 pace pace noforce yes` → max |ΔPE| = 0.000e+00 eV over
-100 MD steps (500-atom Au-Cu, 800 K). Confirms correct energy accumulation and that
-`noforce yes` now skips force loops in both sub-styles.
+Three validation cases were run on the 4000-atom Au-Cu test system. The evaluated energy differences between the two sub-styles in the hybrid pair style is same with and without the optimisation.
 
-**Test 2 — `localE yes` bit-identity (HS_NF vs HS_LE):** `hybrid/scaled noforce yes`
-vs `hybrid/scaled localE yes`, same seed → max |ΔPE| = 0.000e+00 eV. Confirms the
-scaled local-shell approximation is exact for ACE and the accept/reject sequences are
-identical.
+
+![Figure 5](fig_speedup_hybrid_opt.png)
+
+_Figure 5. (Left) energy difference between the two pair styles with simulation time for base and optimised methods (Right) Wall-time speedup of the optimised method in comparison to the base approach.
 
 ---
 
@@ -435,60 +331,3 @@ fix swap all atom/swap 1 10 12 800 ke no types 1 2 localE yes
 
 ---
 
-## 5. Split Per-Style Cache for Alchemical TI (branch `split_cache`)
-
-### Motivation
-
-In alchemical TI workflows the coupling parameter λ is updated every MD timestep:
-
-```lammps
-variable        lam equal ramp(0,1)
-pair_style      hybrid/scaled v_lam pace v_lam pace
-pair_coeff      * * pace 1 Au_end.yace Au Au   # endpoint A — type-invariant
-pair_coeff      * * pace 2 AuCu.yace   Au Cu   # endpoint B — type-aware
-fix swap all atom/swap 1 10 12 800 ke no types 1 2 localE yes
-```
-
-Sub-style 1 maps **both** LAMMPS types to Au (`Au Au`), so the ACE energy of any atom is **independent of the LAMMPS type assignment**.  Swapping types 1↔2 cannot change that sub-style's per-atom energies.
-
-### Optimization
-
-During a trial swap the `localE` path re-evaluates ACE energies for ~2Z affected atoms with each sub-style.  For the type-invariant sub-style (`Au Au`), the "new" energy is identical to the cached value — recomputing it is wasted work.
-
-The split-cache stores per-style unscaled caches independently:
-
-| Array | Contents |
-|---|---|
-| `eatom_sA[i]` | Unscaled energy from the type-**invariant** sub-style |
-| `eatom_sB[i]` | Unscaled energy from the type-**aware** sub-style |
-| `eatom_cached[i]` | `sc_A * eatom_sA[i] + sc_B * eatom_sB[i]` (blended, used for accept/reject) |
-
-During a trial only `compute_atom_energy(k)` for the type-aware sub-style is called; `eatom_sA[k]` is reused directly.  On accept, only `eatom_sB` is updated.
-
-### Code Changes
-
-| Location | Change |
-|---|---|
-| `src/ML-PACE/pair_pace.h` | `is_type_invariant(t1, t2)` — returns true when `map[t1] == map[t2]` |
-| `src/MC/fix_atom_swap.h` | `split_cache_flag`, `invariant_substyle`, `eatom_sA`, `eatom_sB`, `eatom_s_nmax` |
-| `src/MC/fix_atom_swap.cpp` `FixAtomSwap()` | Initialise new members to zero/nullptr |
-| `src/MC/fix_atom_swap.cpp` `~FixAtomSwap()` | `memory->destroy(eatom_sA/sB)` |
-| `src/MC/fix_atom_swap.cpp` `init()` | After building `pace_substyles`: call `is_type_invariant`, set `split_cache_flag`; allocate `eatom_sA/sB` |
-| `src/MC/fix_atom_swap.cpp` `build_eatom_cache()` | New `split_cache_flag` branch fills both per-style arrays then blends |
-| `src/MC/fix_atom_swap.cpp` `attempt_swap()` | Skip `compute_atom_energy` for invariant sub-style; on accept update `eatom_sB` only |
-
-### Expected Speedup
-
-The saving occurs entirely in the trial–recompute phase.  At each MC step the cache rebuild is always a full recompute (positions change via MD), so the gain is proportional to `ncycles / N`:
-
-| `ncycles` | ACE evals saved per step | Approx overall speedup |
-|---|---|---|
-| 10 | ~50 % of trial evals | ~12 % |
-| 100 | ~50 % of trial evals | ~30 % |
-
-### Test
-
-`eam_test/run_splitcache_test.sh` verifies correctness via endpoint consistency:
-- λ=1 (`hybrid/scaled 1 0`, Au Au only): PE must match plain `pace Au Au` — **PASS, max |ΔPE| = 0 eV**
-- λ=0 (`hybrid/scaled 0 1`, Au Cu only): PE must match plain `pace Au Cu` — **PASS, max |ΔPE| = 0 eV**
-- λ=0.5 (split-cache fully active): finite PE, no crash — **PASS**
