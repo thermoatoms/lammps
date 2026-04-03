@@ -81,6 +81,9 @@ class FixAtomSwap : public Fix {
   int nswaptypes, nmutypes;
   int *type_list;
   double *mu;
+  int *mu_var_flag;     // 1 if mu[i] is backed by an equal-style variable
+  int *mu_var_index;    // variable index (from input->variable->find)
+  char **mu_var_names;  // variable names as given in input (without "v_" prefix)
 
   double nswap_attempts;
   double nswap_successes;

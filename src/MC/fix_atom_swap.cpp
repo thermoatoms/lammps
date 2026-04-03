@@ -39,10 +39,12 @@
 #include "pair_hybrid.h"
 #include "pair_hybrid_scaled.h"
 #include "pair_pace.h"
+#include "input.h"
 #include "random_park.h"
 #include "region.h"
 #include "suffix.h"
 #include "update.h"
+#include "variable.h"
 
 #include <cctype>
 #include <cfloat>
@@ -57,6 +59,7 @@ using namespace FixConst;
 
 FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), region(nullptr), idregion(nullptr), type_list(nullptr), mu(nullptr),
+    mu_var_flag(nullptr), mu_var_index(nullptr), mu_var_names(nullptr),
     qtype(nullptr), mtype(nullptr), sqrt_mass_ratio(nullptr), local_swap_iatom_list(nullptr),
     local_swap_jatom_list(nullptr), local_swap_atom_list(nullptr), random_equal(nullptr),
     random_unequal(nullptr), c_pe(nullptr), imgobjs(nullptr), imgparms(nullptr)
@@ -96,6 +99,15 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   memory->create(type_list, atom->ntypes, "atom/swap:type_list");
   memory->create(mu, atom->ntypes + 1, "atom/swap:mu");
   for (int i = 0; i <= atom->ntypes; i++) mu[i] = 0.0;
+
+  memory->create(mu_var_flag, atom->ntypes + 1, "atom/swap:mu_var_flag");
+  memory->create(mu_var_index, atom->ntypes + 1, "atom/swap:mu_var_index");
+  mu_var_names = new char *[atom->ntypes + 1];
+  for (int i = 0; i <= atom->ntypes; i++) {
+    mu_var_flag[i] = 0;
+    mu_var_index[i] = -1;
+    mu_var_names[i] = nullptr;
+  }
 
   // default value for multi-swap count
   nswap_count = 1;
@@ -152,6 +164,12 @@ FixAtomSwap::~FixAtomSwap()
 {
   memory->destroy(type_list);
   memory->destroy(mu);
+  memory->destroy(mu_var_flag);
+  memory->destroy(mu_var_index);
+  if (mu_var_names) {
+    for (int i = 0; i <= atom->ntypes; i++) delete[] mu_var_names[i];
+    delete[] mu_var_names;
+  }
   memory->destroy(qtype);
   memory->destroy(mtype);
   memory->destroy(sqrt_mass_ratio);
@@ -210,10 +228,18 @@ void FixAtomSwap::options(int narg, char **arg)
       if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
       iarg++;
       while (iarg < narg) {
-        if (isalpha(arg[iarg][0])) break;
+        // stop at next keyword (alphabetic, not starting with 'v_')
+        if (isalpha(arg[iarg][0]) && !(arg[iarg][0] == 'v' && arg[iarg][1] == '_')) break;
         nmutypes++;
         if (nmutypes > atom->ntypes) error->all(FLERR, "Illegal fix atom/swap command");
-        mu[nmutypes] = utils::numeric(FLERR, arg[iarg], false, lmp);
+        if (strncmp(arg[iarg], "v_", 2) == 0) {
+          // equal-style variable: store name (strip the "v_" prefix)
+          mu_var_flag[nmutypes] = 1;
+          mu_var_names[nmutypes] = utils::strdup(arg[iarg] + 2);
+          mu[nmutypes] = 0.0;    // placeholder; evaluated at runtime
+        } else {
+          mu[nmutypes] = utils::numeric(FLERR, arg[iarg], false, lmp);
+        }
         iarg++;
       }
     } else if (strcmp(arg[iarg], "swap_count") == 0) {
@@ -275,6 +301,19 @@ void FixAtomSwap::init()
   if (semi_grand_flag) {
     if (nswaptypes != nmutypes)
       error->all(FLERR, Error::NOLASTLINE, "Need nswaptypes mu values in fix atom/swap command");
+    // resolve and validate any variable-backed mu values
+    for (int iswaptype = 0; iswaptype < nswaptypes; iswaptype++) {
+      int itype = type_list[iswaptype];
+      if (mu_var_flag[itype]) {
+        mu_var_index[itype] = input->variable->find(mu_var_names[itype]);
+        if (mu_var_index[itype] < 0)
+          error->all(FLERR, "Variable {} for fix atom/swap mu does not exist",
+                     mu_var_names[itype]);
+        if (!input->variable->equalstyle(mu_var_index[itype]))
+          error->all(FLERR, "Variable {} for fix atom/swap mu must be equal-style",
+                     mu_var_names[itype]);
+      }
+    }
   } else {
     if (nswaptypes != 2)
       error->all(FLERR, Error::NOLASTLINE,
@@ -544,6 +583,15 @@ void FixAtomSwap::pre_exchange()
     energy_stored = build_eatom_cache();
   else
     energy_stored = energy_full();
+
+  // evaluate any variable-backed mu values once per MC block
+  if (semi_grand_flag) {
+    for (int iswaptype = 0; iswaptype < nswaptypes; iswaptype++) {
+      int itype = type_list[iswaptype];
+      if (mu_var_flag[itype])
+        mu[itype] = input->variable->compute_equal(mu_var_index[itype]);
+    }
+  }
 
   // attempt Ncycle atom swaps
 
