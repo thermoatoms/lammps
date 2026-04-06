@@ -60,6 +60,7 @@ using namespace FixConst;
 FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
     Fix(lmp, narg, arg), region(nullptr), idregion(nullptr), type_list(nullptr), mu(nullptr),
     mu_var_flag(nullptr), mu_var_index(nullptr), mu_var_names(nullptr),
+    temp_var_flag(0), temp_var_index(-1), temp_var_name(nullptr),
     qtype(nullptr), mtype(nullptr), sqrt_mass_ratio(nullptr), local_swap_iatom_list(nullptr),
     local_swap_jatom_list(nullptr), local_swap_atom_list(nullptr), random_equal(nullptr),
     random_unequal(nullptr), c_pe(nullptr), imgobjs(nullptr), imgparms(nullptr)
@@ -87,14 +88,21 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   nevery = utils::inumeric(FLERR, arg[3], false, lmp);
   ncycles = utils::inumeric(FLERR, arg[4], false, lmp);
   seed = utils::inumeric(FLERR, arg[5], false, lmp);
-  double temperature = utils::numeric(FLERR, arg[6], false, lmp);
 
   if (nevery <= 0) error->all(FLERR, 3, "Illegal fix atom/swap command nevery value");
   if (ncycles < 0) error->all(FLERR, 4, "Illegal fix atom/swap command ncycles value");
   if (seed <= 0) error->all(FLERR, 5, "Illegal fix atom/swap command random seed");
-  if (temperature <= 0.0) error->all(FLERR, 6, "Illegal fix atom/swap command temperature value");
 
-  beta = 1.0 / (force->boltz * temperature);
+  if (strncmp(arg[6], "v_", 2) == 0) {
+    // equal-style variable for temperature
+    temp_var_flag = 1;
+    temp_var_name = utils::strdup(arg[6] + 2);
+    beta = 0.0;    // placeholder; evaluated in init() and pre_exchange()
+  } else {
+    double temperature = utils::numeric(FLERR, arg[6], false, lmp);
+    if (temperature <= 0.0) error->all(FLERR, 6, "Illegal fix atom/swap command temperature value");
+    beta = 1.0 / (force->boltz * temperature);
+  }
 
   memory->create(type_list, atom->ntypes, "atom/swap:type_list");
   memory->create(mu, atom->ntypes + 1, "atom/swap:mu");
@@ -170,6 +178,7 @@ FixAtomSwap::~FixAtomSwap()
     for (int i = 0; i <= atom->ntypes; i++) delete[] mu_var_names[i];
     delete[] mu_var_names;
   }
+  delete[] temp_var_name;
   memory->destroy(qtype);
   memory->destroy(mtype);
   memory->destroy(sqrt_mass_ratio);
@@ -297,6 +306,21 @@ void FixAtomSwap::init()
   if (nswaptypes < 2)
     error->all(FLERR, Error::NOLASTLINE,
                "Must specify at least 2 atom types in fix atom/swap command");
+
+  // resolve and validate variable-backed temperature
+  if (temp_var_flag) {
+    temp_var_index = input->variable->find(temp_var_name);
+    if (temp_var_index < 0)
+      error->all(FLERR, "Variable {} for fix atom/swap temperature does not exist", temp_var_name);
+    if (!input->variable->equalstyle(temp_var_index))
+      error->all(FLERR, "Variable {} for fix atom/swap temperature must be equal-style",
+                 temp_var_name);
+    // evaluate immediately so beta is valid before first pre_exchange
+    double temperature = input->variable->compute_equal(temp_var_index);
+    if (temperature <= 0.0)
+      error->all(FLERR, "Fix atom/swap variable temperature must be positive");
+    beta = 1.0 / (force->boltz * temperature);
+  }
 
   if (semi_grand_flag) {
     if (nswaptypes != nmutypes)
@@ -584,7 +608,13 @@ void FixAtomSwap::pre_exchange()
   else
     energy_stored = energy_full();
 
-  // evaluate any variable-backed mu values once per MC block
+  // evaluate variable-backed temperature and mu values once per MC block
+  if (temp_var_flag) {
+    double temperature = input->variable->compute_equal(temp_var_index);
+    if (temperature <= 0.0)
+      error->all(FLERR, "Fix atom/swap variable temperature must be positive");
+    beta = 1.0 / (force->boltz * temperature);
+  }
   if (semi_grand_flag) {
     for (int iswaptype = 0; iswaptype < nswaptypes; iswaptype++) {
       int itype = type_list[iswaptype];

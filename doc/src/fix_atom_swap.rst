@@ -15,7 +15,7 @@ Syntax
 * N = invoke this fix every N steps
 * X = number of swaps to attempt every N steps
 * seed = random # seed (positive integer)
-* T = scaling temperature of the MC swaps (temperature units)
+* T = scaling temperature of the MC swaps (temperature units, or equal-style variable v_name)
 * one or more keyword/value pairs may be appended to args
 * keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE*
 
@@ -57,6 +57,14 @@ Description
 This fix performs Monte Carlo swaps of atoms of one given atom type with
 atoms of the other given atom types.  The specified scaling temperature
 *T* is used in the Metropolis criterion dictating swap probabilities.
+*T* may be given as a numeric constant or as an equal-style variable
+using the ``v_name`` syntax, in which case it is re-evaluated once per
+MC block (i.e., once every *N* MD steps).  This allows temperature
+schedules such as ``ramp(T_start, T_end)`` to be applied to the MC
+acceptance criterion independently of the MD thermostat temperature.
+The variable value must be positive at every evaluation.
+
+.. versionchanged:: TBD
 
 Perform *X* swaps of atoms of one type with atoms of another type
 according to a Monte Carlo probability.  Swap candidates must be in
