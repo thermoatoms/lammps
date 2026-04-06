@@ -48,6 +48,9 @@ class FixAtomSwap : public Fix {
 
  private:
   int nevery, seed;
+  int temp_var_flag;    // 1 if temperature is backed by an equal-style variable
+  int temp_var_index;   // variable index for temperature
+  char *temp_var_name;  // variable name (without "v_" prefix)
   int ke_flag;            // yes = conserve ke, no = do not conserve ke
   int semi_grand_flag;    // yes = semi-grand canonical, no = constant composition
   int ncycles;
@@ -81,6 +84,9 @@ class FixAtomSwap : public Fix {
   int nswaptypes, nmutypes;
   int *type_list;
   double *mu;
+  int *mu_var_flag;     // 1 if mu[i] is backed by an equal-style variable
+  int *mu_var_index;    // variable index (from input->variable->find)
+  char **mu_var_names;  // variable names as given in input (without "v_" prefix)
 
   double nswap_attempts;
   double nswap_successes;

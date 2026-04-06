@@ -15,14 +15,14 @@ Syntax
 * N = invoke this fix every N steps
 * X = number of swaps to attempt every N steps
 * seed = random # seed (positive integer)
-* T = scaling temperature of the MC swaps (temperature units)
+* T = scaling temperature of the MC swaps (temperature units, or equal-style variable v_name)
 * one or more keyword/value pairs may be appended to args
 * keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE*
 
   .. parsed-literal::
 
        *types* values = two or more atom types (1-Ntypes or type label)
-       *mu* values = chemical potential of swap types (energy units)
+       *mu* values = chemical potential of swap types (energy units, or equal-style variable v_name)
        *ke* value = *no* or *yes*
          *no* = no conservation of kinetic energy after atom swaps
          *yes* = kinetic energy is conserved after atom swaps
@@ -48,8 +48,7 @@ Examples
    fix 2 all atom/swap 1 1 29494 300.0 ke no types 1 2
    fix myFix all atom/swap 100 1 12345 298.0 region my_swap_region types 5 6
    fix SGMC all atom/swap 1 100 345 1.0 semi-grand yes types 1 2 3 mu 0.0 4.3 -5.0
-   fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5
-   fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
+   fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5   fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
    fix localSwap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
 
 Description
@@ -58,6 +57,14 @@ Description
 This fix performs Monte Carlo swaps of atoms of one given atom type with
 atoms of the other given atom types.  The specified scaling temperature
 *T* is used in the Metropolis criterion dictating swap probabilities.
+*T* may be given as a numeric constant or as an equal-style variable
+using the ``v_name`` syntax, in which case it is re-evaluated once per
+MC block (i.e., once every *N* MD steps).  This allows temperature
+schedules such as ``ramp(T_start, T_end)`` to be applied to the MC
+acceptance criterion independently of the MD thermostat temperature.
+The variable value must be positive at every evaluation.
+
+.. versionchanged:: TBD
 
 Perform *X* swaps of atoms of one type with atoms of another type
 according to a Monte Carlo probability.  Swap candidates must be in
@@ -114,6 +121,26 @@ following the *types* keyword.  In semi-grand canonical ensemble
 simulations the chemical composition of the system is controlled by the
 difference in these values. So shifting all values by a constant amount
 will have no effect on the simulation.
+
+Each *mu* value may be given either as a numeric constant or as an
+equal-style variable using the ``v_name`` syntax.  Variable-style mu
+values are re-evaluated once per MC block (i.e., once every *N* MD
+steps), so they track time-dependent schedules such as ``ramp()``,
+``v_othervar``, or any equal-style expression.  Because ``ramp(v1,v2)``
+evaluates at the current timestep, and the MC block fires at timesteps
+:math:`t_0,\ t_0 + N,\ t_0 + 2N, \ldots`, the chemical potential is
+sampled exactly on those timesteps and the ramp is traversed uniformly.
+For example:
+
+.. code-block:: LAMMPS
+
+   variable dmu equal ramp(-5.0, 5.0)
+   fix SGMC all atom/swap 10 100 345 1.0 semi-grand yes types 1 2 mu v_dmu 0.0
+   run 10000   # 1000 distinct mu values, evenly spaced from -5 to 5
+
+Mixing constants and variables is allowed.
+
+.. versionchanged:: TBD
 
 This command may optionally use the *region* keyword to define swap
 volume.  The specified region must have been previously defined with a
