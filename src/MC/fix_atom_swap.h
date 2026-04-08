@@ -89,9 +89,10 @@ class FixAtomSwap : public Fix {
   char **mu_var_names;  // variable names as given in input (without "v_" prefix)
 
   // adaptive mu stepping via susceptibility
-  int adapt_flag;           // 1 if adaptive stepping is active
+  int adapt_flag;           // 1 if chi-driven adaptive stepping is active
+  int adapt_equal_x_flag;   // 1 if equal-composition-interval stepping is active
   int adapt_type;           // atom type index (1-based) whose mu is driven
-  double adapt_dX;          // target composition step per adaptation
+  double adapt_dX;          // target composition step / interval per adaptation
   int adapt_every;          // number of MC blocks between mu updates (K)
   double adapt_dmu_max;     // max |delta_mu| per step (clamp)
   int adapt_counter;        // blocks accumulated since last mu update
@@ -100,6 +101,7 @@ class FixAtomSwap : public Fix {
   double adapt_x_current;   // current mean composition (for output)
   double adapt_chi_current; // current susceptibility dX/dmu (for output)
   double adapt_mu_current;  // current adaptive mu value (for output)
+  double adapt_x_target;    // next target composition (equal-X mode)
 
   double nswap_attempts;
   double nswap_successes;
