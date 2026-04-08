@@ -70,7 +70,7 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   dynamic_group_allow = 1;
 
   vector_flag = 1;
-  size_vector = 2;
+  size_vector = 5;    // [0]=attempts [1]=successes [2]=X [3]=chi [4]=mu_adapt
   global_freq = 1;
   extvector = 0;
   restart_global = 1;
@@ -116,6 +116,19 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
     mu_var_index[i] = -1;
     mu_var_names[i] = nullptr;
   }
+
+  // adaptive stepping defaults (disabled)
+  adapt_flag = 0;
+  adapt_type = -1;
+  adapt_dX = 0.01;
+  adapt_every = 10;
+  adapt_dmu_max = 10.0;
+  adapt_counter = 0;
+  adapt_sum_N2 = 0.0;
+  adapt_sum_N2sq = 0.0;
+  adapt_x_current = 0.0;
+  adapt_chi_current = 0.0;
+  adapt_mu_current = 0.0;
 
   // default value for multi-swap count
   nswap_count = 1;
@@ -265,6 +278,25 @@ void FixAtomSwap::options(int narg, char **arg)
       if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
       local_energy_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
+    } else if (strcmp(arg[iarg], "adapt") == 0) {
+      // adapt dX K [maxdmu value]
+      if (iarg + 3 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+      adapt_flag = 1;
+      adapt_dX = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      adapt_every = utils::inumeric(FLERR, arg[iarg + 2], false, lmp);
+      if (adapt_dX <= 0.0 || adapt_dX >= 1.0)
+        error->all(FLERR, "Illegal fix atom/swap adapt dX: must be in (0, 1)");
+      if (adapt_every < 1)
+        error->all(FLERR, "Illegal fix atom/swap adapt K: must be >= 1");
+      iarg += 3;
+      // optional maxdmu sub-keyword
+      if (iarg + 1 < narg && strcmp(arg[iarg], "maxdmu") == 0) {
+        if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+        adapt_dmu_max = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+        if (adapt_dmu_max <= 0.0)
+          error->all(FLERR, "Illegal fix atom/swap adapt maxdmu: must be positive");
+        iarg += 2;
+      }
     } else
       error->all(FLERR, "Illegal fix atom/swap command");
   }
@@ -337,6 +369,17 @@ void FixAtomSwap::init()
           error->all(FLERR, "Variable {} for fix atom/swap mu must be equal-style",
                      mu_var_names[itype]);
       }
+    }
+    // validate adaptive stepping
+    if (adapt_flag) {
+      if (mu_var_flag[type_list[1]])
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Fix atom/swap adapt is not compatible with v_ variable mu");
+      if (nswaptypes != 2)
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Fix atom/swap adapt requires exactly 2 swap types");
+      adapt_type = type_list[1];    // track type-2 fraction; type-1 is baseline
+      adapt_mu_current = mu[adapt_type];
     }
   } else {
     if (nswaptypes != 2)
@@ -634,7 +677,53 @@ void FixAtomSwap::pre_exchange()
     for (int i = 0; i < ncycles; i++) nsuccess += attempt_swap();
   }
 
-  // udpate MC stats
+  // adaptive susceptibility-driven mu stepping (semi-grand, 2-type only)
+  if (adapt_flag) {
+    // count N_adapt_type globally after this block's accepted swaps
+    int n2_local = 0;
+    int *type = atom->type;
+    for (int i = 0; i < atom->nlocal; i++)
+      if (type[i] == adapt_type) n2_local++;
+    int n2_global = 0;
+    MPI_Allreduce(&n2_local, &n2_global, 1, MPI_INT, MPI_SUM, world);
+
+    int n_total = atom->natoms;
+    adapt_x_current = static_cast<double>(n2_global) / static_cast<double>(n_total);
+
+    adapt_sum_N2   += static_cast<double>(n2_global);
+    adapt_sum_N2sq += static_cast<double>(n2_global) * static_cast<double>(n2_global);
+    adapt_counter++;
+
+    if (adapt_counter >= adapt_every) {
+      double mean_N2  = adapt_sum_N2   / adapt_counter;
+      double mean_N2sq = adapt_sum_N2sq / adapt_counter;
+      double var_N2   = mean_N2sq - mean_N2 * mean_N2;
+
+      // chi = beta * Var(N2) / N_total   [dimensionless dX/dmu]
+      double chi = beta * var_N2 / static_cast<double>(n_total);
+      adapt_chi_current = chi;
+
+      // step mu; clamp to maxdmu to avoid runaway in flat regions
+      double dmu = 0.0;
+      if (chi > 1.0e-10)
+        dmu = adapt_dX / chi;
+      else
+        dmu = adapt_dmu_max;    // flat region: take max step
+
+      if (dmu >  adapt_dmu_max) dmu =  adapt_dmu_max;
+      if (dmu < -adapt_dmu_max) dmu = -adapt_dmu_max;
+
+      mu[adapt_type] += dmu;
+      adapt_mu_current = mu[adapt_type];
+
+      // reset accumulators
+      adapt_sum_N2   = 0.0;
+      adapt_sum_N2sq = 0.0;
+      adapt_counter  = 0;
+    }
+  }
+
+  // update MC stats
 
   nswap_attempts += ncycles;
   nswap_successes += nsuccess;
@@ -1284,6 +1373,9 @@ double FixAtomSwap::compute_vector(int n)
 {
   if (n == 0) return nswap_attempts;
   if (n == 1) return nswap_successes;
+  if (n == 2) return adapt_x_current;
+  if (n == 3) return adapt_chi_current;
+  if (n == 4) return adapt_mu_current;
   return 0.0;
 }
 
@@ -1304,13 +1396,15 @@ double FixAtomSwap::memory_usage()
 void FixAtomSwap::write_restart(FILE *fp)
 {
   int n = 0;
-  double list[6];
+  double list[8];
   list[n++] = random_equal->state();
   list[n++] = random_unequal->state();
   list[n++] = ubuf(next_reneighbor).d;
   list[n++] = nswap_attempts;
   list[n++] = nswap_successes;
   list[n++] = ubuf(update->ntimestep).d;
+  list[n++] = adapt_mu_current;   // adaptive mu value (valid even when adapt_flag=0)
+  list[n++] = ubuf(adapt_counter).d;
 
   if (comm->me == 0) {
     int size = n * sizeof(double);
@@ -1342,6 +1436,17 @@ void FixAtomSwap::restart(char *buf)
   bigint ntimestep_restart = (bigint) ubuf(list[n++]).i;
   if (ntimestep_restart != update->ntimestep)
     error->all(FLERR, "Must not reset timestep when restarting fix atom/swap");
+
+  // restore adaptive mu (always written; only applied when adapt_flag is on)
+  double saved_mu = list[n++];
+  adapt_counter = static_cast<int>(ubuf(list[n++]).i);
+  if (adapt_flag) {
+    mu[adapt_type] = saved_mu;
+    adapt_mu_current = saved_mu;
+  }
+  // reset partial accumulators so the resumed run starts clean
+  adapt_sum_N2   = 0.0;
+  adapt_sum_N2sq = 0.0;
 }
 
 /* ----------------------------------------------------------------------

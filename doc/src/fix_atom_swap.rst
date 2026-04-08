@@ -17,7 +17,7 @@ Syntax
 * seed = random # seed (positive integer)
 * T = scaling temperature of the MC swaps (temperature units, or equal-style variable v_name)
 * one or more keyword/value pairs may be appended to args
-* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE*
+* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE* or *adapt*
 
   .. parsed-literal::
 
@@ -39,6 +39,10 @@ Syntax
        *localE* value = *no* or *yes*
          *no* = evaluate full system energy for each MC trial
          *yes* = evaluate only the local coordination-shell energy change (PACE only)
+       *adapt* values = dX K [maxdmu value]
+         dX = target composition step per mu update (dimensionless, in (0,1))
+         K = number of MC blocks to accumulate before each mu update
+         *maxdmu* value = maximum absolute mu step per update (energy units, default 10*kT)
 
 Examples
 """"""""
@@ -48,6 +52,8 @@ Examples
    fix 2 all atom/swap 1 1 29494 300.0 ke no types 1 2
    fix myFix all atom/swap 100 1 12345 298.0 region my_swap_region types 5 6
    fix SGMC all atom/swap 1 100 345 1.0 semi-grand yes types 1 2 3 mu 0.0 4.3 -5.0
+   fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10
+   fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10 maxdmu 2.0
    fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5   fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
    fix localSwap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
 
@@ -194,6 +200,43 @@ a single ``MPI_Allreduce`` per trial replaces the full pair compute
 reduction.  The expected speedup over *noforce yes* is proportional to
 N / Z, where N is the number of atoms and Z is the coordination number
 (typically 50-80x for a 4000-atom system).
+
+.. versionadded:: TBD
+
+The *adapt* keyword activates susceptibility-driven adaptive stepping of
+the chemical potential (``mu``) for the second swap type.  It is only
+compatible with *semi-grand yes* and exactly two swap types.  Rather than
+traversing a pre-defined mu schedule at equal spacing, the fix measures
+the local thermodynamic susceptibility
+
+.. math::
+
+   \chi \equiv \frac{d\langle X \rangle}{d\mu} = \frac{\beta}{N} \mathrm{Var}(N_2)
+
+from the fluctuations of the type-2 count :math:`N_2` accumulated over
+*K* consecutive MC blocks.  It then updates mu by
+
+.. math::
+
+   \Delta\mu = \frac{\Delta X_\mathrm{target}}{\chi}
+
+so that each update moves the expected composition by *dX*.  This
+automatically concentrates mu points near steep transitions
+(large :math:`\chi`) and takes large steps in flat regions (small
+:math:`\chi`), giving uniform resolution in composition space without
+any user knowledge of where the transition occurs.
+
+The optional *maxdmu* sub-keyword (default: 10.0 in energy units) caps
+:math:`|\Delta\mu|` per step, preventing runaway in regions where
+composition is truly flat and :math:`\chi \approx 0`.
+
+The current composition :math:`X` (type-2 fraction), local susceptibility
+:math:`\chi`, and current adaptive mu value are accessible as
+``f_ID[3]``, ``f_ID[4]``, and ``f_ID[5]`` respectively, and can be
+monitored via :doc:`thermo_style custom <thermo_style>`.
+
+The *adapt* keyword is not compatible with variable-backed mu (``v_``
+syntax) for the driven type, nor with ``swap_count > 1``.
 
 You should ensure you do not swap atoms belonging to a molecule, or
 LAMMPS will eventually generate an error when it tries to find those
