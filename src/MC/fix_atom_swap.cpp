@@ -70,7 +70,7 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   dynamic_group_allow = 1;
 
   vector_flag = 1;
-  size_vector = 6;    // [0]=attempts [1]=successes [2]=X [3]=chi [4]=mu_adapt [5]=X_target
+  size_vector = 5;    // [0]=attempts [1]=successes [2]=X [3]=chi [4]=mu_adapt
   global_freq = 1;
   extvector = 0;
   restart_global = 1;
@@ -119,18 +119,19 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
 
   // adaptive stepping defaults (disabled)
   adapt_flag = 0;
-  adapt_equal_x_flag = 0;
   adapt_type = -1;
+  adapt_tracked_index = 1;    // default: track second listed type (type_list[1])
   adapt_dX = 0.01;
   adapt_every = 10;
   adapt_dmu_max = 10.0;
+  adapt_mu_lo = -DBL_MAX;
+  adapt_mu_hi =  DBL_MAX;
   adapt_counter = 0;
   adapt_sum_N2 = 0.0;
   adapt_sum_N2sq = 0.0;
   adapt_x_current = 0.0;
   adapt_chi_current = 0.0;
   adapt_mu_current = 0.0;
-  adapt_x_target = 0.0;
 
   // default value for multi-swap count
   nswap_count = 1;
@@ -281,7 +282,7 @@ void FixAtomSwap::options(int narg, char **arg)
       local_energy_flag = utils::logical(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg], "adapt") == 0) {
-      // adapt dX K [maxdmu value]
+      // adapt dX K [maxdmu value] [tracked N] [mumin val] [mumax val]
       if (iarg + 3 > narg) error->all(FLERR, "Illegal fix atom/swap command");
       adapt_flag = 1;
       adapt_dX = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
@@ -291,33 +292,32 @@ void FixAtomSwap::options(int narg, char **arg)
       if (adapt_every < 1)
         error->all(FLERR, "Illegal fix atom/swap adapt K: must be >= 1");
       iarg += 3;
-      // optional maxdmu sub-keyword
-      if (iarg + 1 < narg && strcmp(arg[iarg], "maxdmu") == 0) {
-        if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
-        adapt_dmu_max = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
-        if (adapt_dmu_max <= 0.0)
-          error->all(FLERR, "Illegal fix atom/swap adapt maxdmu: must be positive");
-        iarg += 2;
-      }
-    } else if (strcmp(arg[iarg], "adaptX") == 0) {
-      // adaptX dX K [maxdmu value]
-      // equal-composition-interval stepping: drives mu to hit X = dX, 2*dX, 3*dX, ...
-      if (iarg + 3 > narg) error->all(FLERR, "Illegal fix atom/swap command");
-      adapt_equal_x_flag = 1;
-      adapt_dX = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
-      adapt_every = utils::inumeric(FLERR, arg[iarg + 2], false, lmp);
-      if (adapt_dX <= 0.0 || adapt_dX >= 1.0)
-        error->all(FLERR, "Illegal fix atom/swap adaptX dX: must be in (0, 1)");
-      if (adapt_every < 1)
-        error->all(FLERR, "Illegal fix atom/swap adaptX K: must be >= 1");
-      iarg += 3;
-      // optional maxdmu sub-keyword
-      if (iarg + 1 < narg && strcmp(arg[iarg], "maxdmu") == 0) {
-        if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
-        adapt_dmu_max = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
-        if (adapt_dmu_max <= 0.0)
-          error->all(FLERR, "Illegal fix atom/swap adaptX maxdmu: must be positive");
-        iarg += 2;
+      // optional sub-keywords: maxdmu, tracked, mumin, mumax
+      while (iarg < narg) {
+        if (strcmp(arg[iarg], "maxdmu") == 0) {
+          if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+          adapt_dmu_max = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+          if (adapt_dmu_max <= 0.0)
+            error->all(FLERR, "Illegal fix atom/swap adapt maxdmu: must be positive");
+          iarg += 2;
+        } else if (strcmp(arg[iarg], "tracked") == 0) {
+          // tracked N: N is 1 or 2 (1-based index into the types list)
+          if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+          int idx = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+          if (idx < 1 || idx > 2)
+            error->all(FLERR, "Illegal fix atom/swap adapt tracked: must be 1 or 2");
+          adapt_tracked_index = idx - 1;    // convert to 0-based
+          iarg += 2;
+        } else if (strcmp(arg[iarg], "mumin") == 0) {
+          if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+          adapt_mu_lo = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+          iarg += 2;
+        } else if (strcmp(arg[iarg], "mumax") == 0) {
+          if (iarg + 2 > narg) error->all(FLERR, "Illegal fix atom/swap command");
+          adapt_mu_hi = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+          iarg += 2;
+        } else
+          break;
       }
     } else
       error->all(FLERR, "Illegal fix atom/swap command");
@@ -400,25 +400,10 @@ void FixAtomSwap::init()
       if (nswaptypes != 2)
         error->all(FLERR, Error::NOLASTLINE,
                    "Fix atom/swap adapt requires exactly 2 swap types");
-      adapt_type = type_list[1];    // track type-2 fraction; type-1 is baseline
+      adapt_type = type_list[adapt_tracked_index];   // user-selected or default type_list[1]
       adapt_mu_current = mu[adapt_type];
-    }
-    // validate equal-X adaptive stepping
-    if (adapt_equal_x_flag) {
-      if (adapt_flag)
-        error->all(FLERR, Error::NOLASTLINE,
-                   "Fix atom/swap: adapt and adaptX are mutually exclusive");
-      if (mu_var_flag[type_list[1]])
-        error->all(FLERR, Error::NOLASTLINE,
-                   "Fix atom/swap adaptX is not compatible with v_ variable mu");
-      if (nswaptypes != 2)
-        error->all(FLERR, Error::NOLASTLINE,
-                   "Fix atom/swap adaptX requires exactly 2 swap types");
-      adapt_type = type_list[1];
-      adapt_mu_current = mu[adapt_type];
-      // initialise first target to dX above whatever the current composition is
-      // (will be properly set on first K-block evaluation)
-      adapt_x_target = adapt_dX;
+      if (adapt_mu_lo >= adapt_mu_hi)
+        error->all(FLERR, "Fix atom/swap adapt: mumin must be less than mumax");
     }
   } else {
     if (nswaptypes != 2)
@@ -753,57 +738,8 @@ void FixAtomSwap::pre_exchange()
       if (dmu < -adapt_dmu_max) dmu = -adapt_dmu_max;
 
       mu[adapt_type] += dmu;
-      adapt_mu_current = mu[adapt_type];
-
-      // reset accumulators
-      adapt_sum_N2   = 0.0;
-      adapt_sum_N2sq = 0.0;
-      adapt_counter  = 0;
-    }
-  }
-
-  // equal-composition-interval adaptive mu stepping (adaptX keyword)
-  if (adapt_equal_x_flag) {
-    // count N_adapt_type globally
-    int n2_local = 0;
-    int *type = atom->type;
-    for (int i = 0; i < atom->nlocal; i++)
-      if (type[i] == adapt_type) n2_local++;
-    int n2_global = 0;
-    MPI_Allreduce(&n2_local, &n2_global, 1, MPI_INT, MPI_SUM, world);
-
-    int n_total = atom->natoms;
-    adapt_x_current = static_cast<double>(n2_global) / static_cast<double>(n_total);
-
-    adapt_sum_N2   += static_cast<double>(n2_global);
-    adapt_sum_N2sq += static_cast<double>(n2_global) * static_cast<double>(n2_global);
-    adapt_counter++;
-
-    if (adapt_counter >= adapt_every) {
-      double mean_N2   = adapt_sum_N2   / adapt_counter;
-      double mean_N2sq = adapt_sum_N2sq / adapt_counter;
-      double var_N2    = mean_N2sq - mean_N2 * mean_N2;
-      double chi       = beta * var_N2 / static_cast<double>(n_total);
-      adapt_chi_current = chi;
-
-      // advance target if current X has reached or passed it
-      if (adapt_x_current >= adapt_x_target - 0.5 * adapt_dX) {
-        adapt_x_target += adapt_dX;
-        if (adapt_x_target > 1.0) adapt_x_target = 1.0;
-      }
-
-      // proportional control: drive X toward next target
-      double err = adapt_x_target - adapt_x_current;
-      double dmu = 0.0;
-      if (chi > 1.0e-10)
-        dmu = err / chi;
-      else
-        dmu = (err >= 0.0) ? adapt_dmu_max : -adapt_dmu_max;
-
-      if (dmu >  adapt_dmu_max) dmu =  adapt_dmu_max;
-      if (dmu < -adapt_dmu_max) dmu = -adapt_dmu_max;
-
-      mu[adapt_type] += dmu;
+      if (mu[adapt_type] < adapt_mu_lo) mu[adapt_type] = adapt_mu_lo;
+      if (mu[adapt_type] > adapt_mu_hi) mu[adapt_type] = adapt_mu_hi;
       adapt_mu_current = mu[adapt_type];
 
       // reset accumulators
@@ -1466,7 +1402,6 @@ double FixAtomSwap::compute_vector(int n)
   if (n == 2) return adapt_x_current;
   if (n == 3) return adapt_chi_current;
   if (n == 4) return adapt_mu_current;
-  if (n == 5) return adapt_x_target;    // equal-X mode: current target composition
   return 0.0;
 }
 
@@ -1487,7 +1422,7 @@ double FixAtomSwap::memory_usage()
 void FixAtomSwap::write_restart(FILE *fp)
 {
   int n = 0;
-  double list[10];
+  double list[8];
   list[n++] = random_equal->state();
   list[n++] = random_unequal->state();
   list[n++] = ubuf(next_reneighbor).d;
@@ -1496,8 +1431,6 @@ void FixAtomSwap::write_restart(FILE *fp)
   list[n++] = ubuf(update->ntimestep).d;
   list[n++] = adapt_mu_current;   // adaptive mu value (valid even when adapt_flag=0)
   list[n++] = ubuf(adapt_counter).d;
-  list[n++] = adapt_x_target;     // equal-X mode: current target composition
-  list[n++] = adapt_x_current;    // equal-X mode: last measured composition
 
   if (comm->me == 0) {
     int size = n * sizeof(double);
@@ -1536,17 +1469,6 @@ void FixAtomSwap::restart(char *buf)
   if (adapt_flag) {
     mu[adapt_type] = saved_mu;
     adapt_mu_current = saved_mu;
-  }
-  // restore equal-X mode state
-  if (n < 10) {
-    // old restart file without the extra fields: leave defaults
-  } else {
-    adapt_x_target  = list[n++];
-    adapt_x_current = list[n++];
-    if (adapt_equal_x_flag) {
-      mu[adapt_type] = saved_mu;
-      adapt_mu_current = saved_mu;
-    }
   }
   // reset partial accumulators so the resumed run starts clean
   adapt_sum_N2   = 0.0;

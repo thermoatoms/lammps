@@ -39,10 +39,13 @@ Syntax
        *localE* value = *no* or *yes*
          *no* = evaluate full system energy for each MC trial
          *yes* = evaluate only the local coordination-shell energy change (PACE only)
-       *adapt* values = dX K [maxdmu value]
+       *adapt* values = dX K [*maxdmu* value] [*tracked* N] [*mumin* value] [*mumax* value]
          dX = target composition step per mu update (dimensionless, in (0,1))
          K = number of MC blocks to accumulate before each mu update
-         *maxdmu* value = maximum absolute mu step per update (energy units, default 10*kT)
+         *maxdmu* value = maximum absolute mu step per update (energy units, default 10.0)
+         *tracked* value = 1 or 2 — which of the two listed types has its mu driven (default 2)
+         *mumin* value = hard lower bound on the adaptive mu value (energy units, default: none)
+         *mumax* value = hard upper bound on the adaptive mu value (energy units, default: none)
 
 Examples
 """"""""
@@ -53,7 +56,7 @@ Examples
    fix myFix all atom/swap 100 1 12345 298.0 region my_swap_region types 5 6
    fix SGMC all atom/swap 1 100 345 1.0 semi-grand yes types 1 2 3 mu 0.0 4.3 -5.0
    fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10
-   fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10 maxdmu 2.0
+   fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10 maxdmu 2.0 mumin -15.0 mumax 5.0
    fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5   fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
    fix localSwap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
 
@@ -204,7 +207,7 @@ N / Z, where N is the number of atoms and Z is the coordination number
 .. versionadded:: TBD
 
 The *adapt* keyword activates susceptibility-driven adaptive stepping of
-the chemical potential (``mu``) for the second swap type.  It is only
+the chemical potential (``mu``) for the tracked swap type.  It is only
 compatible with *semi-grand yes* and exactly two swap types.  Rather than
 traversing a pre-defined mu schedule at equal spacing, the fix measures
 the local thermodynamic susceptibility
@@ -213,7 +216,7 @@ the local thermodynamic susceptibility
 
    \chi \equiv \frac{d\langle X \rangle}{d\mu} = \frac{\beta}{N} \mathrm{Var}(N_2)
 
-from the fluctuations of the type-2 count :math:`N_2` accumulated over
+from the fluctuations of the tracked-type count accumulated over
 *K* consecutive MC blocks.  It then updates mu by
 
 .. math::
@@ -226,14 +229,27 @@ automatically concentrates mu points near steep transitions
 :math:`\chi`), giving uniform resolution in composition space without
 any user knowledge of where the transition occurs.
 
+By default the second of the two listed types is the adapted species
+(i.e., its ``mu`` entry is driven).  Use the *tracked* sub-keyword to
+change which type is tracked: ``tracked 1`` drives the mu of the first
+listed type instead.  Note that the initial value of the adaptive mu is
+taken from the ``mu`` value supplied for that species, so it should be
+set to the desired starting chemical potential.
+
 The optional *maxdmu* sub-keyword (default: 10.0 in energy units) caps
 :math:`|\Delta\mu|` per step, preventing runaway in regions where
 composition is truly flat and :math:`\chi \approx 0`.
 
-The current composition :math:`X` (type-2 fraction), local susceptibility
-:math:`\chi`, and current adaptive mu value are accessible as
-``f_ID[3]``, ``f_ID[4]``, and ``f_ID[5]`` respectively, and can be
-monitored via :doc:`thermo_style custom <thermo_style>`.
+The optional *mumin* and *mumax* sub-keywords set hard lower and upper
+bounds on the adaptive mu value.  Once the running mu reaches a bound it
+is clamped there and will not cross it regardless of the susceptibility
+estimate.  These are useful to confine the scan to a physically
+relevant range and to prevent runaway at the edges of a phase diagram.
+
+The current composition :math:`X` (tracked-type fraction), local
+susceptibility :math:`\chi`, and current adaptive mu value are
+accessible as ``f_ID[3]``, ``f_ID[4]``, and ``f_ID[5]`` respectively,
+and can be monitored via :doc:`thermo_style custom <thermo_style>`.
 
 The *adapt* keyword is not compatible with variable-backed mu (``v_``
 syntax) for the driven type, nor with ``swap_count > 1``.
@@ -331,12 +347,15 @@ uninterrupted fashion.
 None of the :doc:`fix_modify <fix_modify>` options are relevant to this
 fix.
 
-This fix computes a global vector of length 2, which can be accessed
+This fix computes a global vector of length 5, which can be accessed
 by various :doc:`output commands <Howto_output>`.  The vector values are
-the following global cumulative quantities:
+the following global quantities:
 
-  #. swap attempts
-  #. swap accepts
+  #. swap attempts (cumulative)
+  #. swap accepts (cumulative)
+  #. current composition :math:`X` of the tracked type (0 when *adapt* is not active)
+  #. current susceptibility :math:`\chi = \beta\,\mathrm{Var}(N_2)/N` (0 when *adapt* is not active)
+  #. current value of the adaptive mu (0 when *adapt* is not active)
 
 The vector values calculated by this fix are "intensive".
 
