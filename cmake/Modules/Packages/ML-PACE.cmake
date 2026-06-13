@@ -10,7 +10,7 @@ else()
       cmake_policy(SET CMP0135 OLD)
     endif()
 
-    set(PACELIB_URL "https://github.com/thermoatoms/lammps-user-pace/archive/refs/heads/main.tar.gz" CACHE STRING "URL for PACE evaluator library sources")
+    set(PACELIB_URL "https://github.com/thermoatoms/lammps-user-pace/archive/refs/heads/alchemy.tar.gz" CACHE STRING "URL for PACE evaluator library sources")
     mark_as_advanced(PACELIB_URL)
 
     # LOCAL_ML-PACE points to top-level dir with local lammps-user-pace repo,
