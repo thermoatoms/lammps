@@ -246,6 +246,52 @@ void *PairGRACEFSAlch::extract_peratom(const char *str, int &ncol)
   return nullptr;
 }
 
+/* ----------------------------------------------------------------------
+   PHASE 2 (swap-MC): sum of per-atom energies over the given LOCAL atom
+   indices, evaluated with the CURRENT atom->dvector[index_lambda]. Mirrors
+   the energy part of compute() (no forces, no tally) for one atom at a time.
+   The caller (fix alchemical/switch) uses this twice — before and after a
+   lambda swap — to get a local Metropolis dE. Because the FS energy is
+   many-body, the caller MUST include the swapped atoms and their neighbours
+   in `atomlist`. Requires a current neighbour list (mid-run is fine).
+------------------------------------------------------------------------- */
+
+double PairGRACEFSAlch::cluster_energy(const int *atomlist, int n)
+{
+  double **x = atom->x;
+  int *type = atom->type;
+  int *numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
+
+  // point the evaluator at the live lambda array (locals + ghosts)
+  aceimpl->ace->lambda = atom->dvector[index_lambda];
+
+  // size the neighbour cache to the largest jnum we will hit
+  int max_jnum = 0;
+  for (int k = 0; k < n; k++) {
+    const int i = atomlist[k];
+    if (numneigh[i] > max_jnum) max_jnum = numneigh[i];
+  }
+  aceimpl->ace->resize_neighbours_cache(max_jnum);
+  std::vector<int> my_neigh_jlist(max_jnum > 0 ? max_jnum : 1);
+
+  double e_sum = 0.0;
+  for (int k = 0; k < n; k++) {
+    const int i = atomlist[k];
+    const int itype = type[i];
+    const int jnum = numneigh[i];
+    int *jlist = firstneigh[i];
+    for (int jj = 0; jj < jnum; ++jj) my_neigh_jlist[jj] = jlist[jj] & NEIGHMASK;
+    try {
+      aceimpl->ace->compute_atom(i, x, type, jnum, my_neigh_jlist.data());
+    } catch (std::exception &e) {
+      error->one(FLERR, e.what());
+    }
+    e_sum += scale[itype][itype] * aceimpl->ace->e_atom;
+  }
+  return e_sum;
+}
+
 /* ---------------------------------------------------------------------- */
 
 void PairGRACEFSAlch::allocate()

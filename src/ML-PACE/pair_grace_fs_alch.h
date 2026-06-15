@@ -57,6 +57,14 @@ class PairGRACEFSAlch : public Pair {
 
   void *extract_peratom(const char *, int &) override;
 
+  // PHASE 2 (swap-MC): sum of per-atom energies over a given set of LOCAL atom
+  // indices, evaluated with the CURRENT per-atom lambda. Used by
+  // fix alchemical/switch to compute a local Metropolis dE for a lambda swap
+  // without a full-system force evaluation. Recomputes each atom's e_atom from
+  // its own neighbour list (FS energy is many-body, so the caller must include
+  // the swapped atoms AND their neighbours in the set). Returns eV.
+  double cluster_energy(const int *atomlist, int n);
+
  protected:
   struct ACEAlchImpl *aceimpl;
 

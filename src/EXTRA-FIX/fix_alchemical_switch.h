@@ -22,7 +22,15 @@
 //   fix <id> <group> alchemical/switch <pairstyle> \
 //       pair <typeA> <typeB> xtarget <x> \
 //       nsub <n> nrelax <m> seed <s> \
-//       [order random|file <fname>] [avg yes|no] [out <fname>]
+//       [order random|file <fname>] [avg yes|no] [out <fname>] \
+//       [nswap <N> swapevery <M> swaptemp <T_K>]
+//
+//   PHASE 2 swap-MC (optional): every <M> steps attempt <N> Metropolis swaps
+//   of a lambda=1 <-> lambda=0 atom pair at fixed composition (exchange their
+//   lambda), accept on exp(-dE/kT), kT = boltz*<T_K>. Injects configurational
+//   entropy that the relaxed switch-work alone does not capture. dE is the
+//   full-system pair energy before/after (MPI-correct, ~2 force evals/attempt;
+//   keep N small). Runs during AND after the switch schedule.
 //
 //   pair <A> <B> xtarget <x> : drive the global mole fraction of species A
 //       toward target x by converting A<->B. nswitch = round(|x - x0| * N),
@@ -42,7 +50,8 @@
 // BEFORE this fix); dE/dlambda comes from the pair style via
 // extract_peratom("dedlam"). See fix_lambda_dynamics for the shared idioms.
 //
-// Output (compute_vector): [0] nswitched, [1] x = nswitched/N, [2] F(x).
+// Output (compute_vector): [0] nswitched, [1] x = nswitched/N, [2] F(x),
+//   [3] nswap_attempt, [4] nswap_accept, [5] swap accept ratio.
 //
 
 #ifdef FIX_CLASS
@@ -80,6 +89,15 @@ class FixAlchemicalSwitch : public Fix {
   int nsub;                  // lambda increments per atom
   int nrelax;                // MD steps between increments
   int seed;
+
+  // PHASE 2 (swap-MC for configurational entropy): every `swap_every` steps,
+  // attempt `nswap` Metropolis swaps of a lambda=1 <-> lambda=0 atom pair at
+  // fixed composition. dE from the FS-local cluster (pair->cluster_energy),
+  // reduced across ranks. Off by default (nswap=0).
+  int nswap;                 // swap attempts per swap cycle
+  int swap_every;            // MD steps between swap cycles (0 = never)
+  double swap_temp;          // Metropolis temperature (K); required if nswap>0
+  int nswap_attempt, nswap_accept;   // running counters
   int avg_flag;              // 0 = last-step snapshot, 1 = block-average dedlam
   int order_random;          // 1 = seeded shuffle, 0 = from file
   char *order_file;          // atom-ID list if order_random == 0
@@ -116,6 +134,10 @@ class FixAlchemicalSwitch : public Fix {
   double active_dedlam();    // MPI_Allreduce'd <dE/dlambda> of the active atom
   void   set_lambda(tagint id, double val);   // set d_lambda on the owner
   void   build_order();      // construct switch_order + direction
+
+  // PHASE 2 swap-MC helpers
+  void   attempt_swaps();    // one swap cycle of nswap Metropolis attempts
+  double energy_full();      // total pair energy (eV), MPI-summed (atom/swap style)
 };
 
 }    // namespace LAMMPS_NS

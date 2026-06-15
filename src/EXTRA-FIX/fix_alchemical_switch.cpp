@@ -15,6 +15,7 @@
 #include "error.h"
 #include "force.h"
 #include "memory.h"
+#include "modify.h"
 #include "pair.h"
 #include "random_mars.h"
 #include "update.h"
@@ -42,6 +43,10 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
   avg_flag = 0;
   order_random = 1;
   seed = 12345;
+  nswap = 0;            // swap-MC off by default
+  swap_every = 0;
+  swap_temp = -1.0;     // <=0 -> use simulation temperature
+  nswap_attempt = nswap_accept = 0;
 
   int iarg = 4;
   type_A = type_B = -1;
@@ -84,6 +89,15 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
       delete[] out_file;
       out_file = utils::strdup(arg[iarg + 1]);
       iarg += 2;
+    } else if (strcmp(arg[iarg], "nswap") == 0) {
+      nswap = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "swapevery") == 0) {
+      swap_every = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "swaptemp") == 0) {
+      swap_temp = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
     } else
       error->all(FLERR, "Unknown fix alchemical/switch keyword: {}", arg[iarg]);
   }
@@ -92,13 +106,19 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
   if (xtarget < 0.0) error->all(FLERR, "fix alchemical/switch: 'xtarget <x>' required");
   if (nsub <= 0) error->all(FLERR, "fix alchemical/switch: 'nsub > 0' required");
   if (nrelax <= 0) error->all(FLERR, "fix alchemical/switch: 'nrelax > 0' required");
+  if (nswap > 0 && swap_every <= 0)
+    error->all(FLERR, "fix alchemical/switch: nswap>0 requires swapevery>0");
+  if (nswap > 0 && swap_temp <= 0.0)
+    error->all(FLERR, "fix alchemical/switch: nswap>0 requires swaptemp>0 (K)");
 
-  if (order_random) random = new RanMars(lmp, seed + comm->me);
+  // rank-IDENTICAL stream: used by attempt_swaps so every rank makes the same
+  // choices (the order shuffle in build_order uses its own local RNG).
+  random = new RanMars(lmp, seed);
 
-  // outputs: [nswitched, x, F(x)]
+  // outputs: [nswitched, x, F(x), nswap_attempt, nswap_accept, accept_ratio]
   vector_flag = 1;
-  size_vector = 3;
-  global_freq = nrelax;
+  size_vector = 6;
+  global_freq = 1;   // values are valid every step (counters + running F)
   extvector = 0;
 
   comm_forward = 1;    // lambda -> ghosts every step
@@ -304,6 +324,119 @@ double FixAlchemicalSwitch::active_dedlam()
 }
 
 /* ----------------------------------------------------------------------
+   total pair energy (eV), MPI-summed. Bulletproof (atom/swap style): drive a
+   full pair compute with eflag and reduce eng_vdwl. Slow per call (full force
+   eval) but guaranteed MPI-correct for the many-body FS energy. A future fast
+   path can use pair->cluster_energy over the affected local cluster instead.
+------------------------------------------------------------------------- */
+
+double FixAlchemicalSwitch::energy_full()
+{
+  comm->forward_comm(this);           // make sure ghosts see current lambda
+  if (modify->n_pre_force) modify->pre_force(0);
+  if (force->pair) force->pair->compute(1, 0);   // eflag=1, vflag=0
+  if (modify->n_post_force_any) modify->post_force(0);
+  double e_local = force->pair ? force->pair->eng_vdwl : 0.0;
+  double e_global = 0.0;
+  MPI_Allreduce(&e_local, &e_global, 1, MPI_DOUBLE, MPI_SUM, world);
+  return e_global;
+}
+
+/* ----------------------------------------------------------------------
+   one swap cycle: nswap Metropolis attempts. Each attempt exchanges lambda
+   between one lambda=1 atom and one lambda=0 atom (FIXED composition) and
+   accepts on exp(-dE/kT). All random choices are made identically on every
+   rank (rank-independent stream) so the schedule is MPI-consistent; the
+   energy is the MPI-summed full pair energy.
+
+   The pools (lambda~=1 ids, lambda~=0 ids) are rebuilt each cycle by gathering
+   the alchemical-pair atoms' current lambda globally.
+------------------------------------------------------------------------- */
+
+void FixAlchemicalSwitch::attempt_swaps()
+{
+  const int nlocal = atom->nlocal;
+  const int *type = atom->type;
+  const tagint *tag = atom->tag;
+  double *lambda = lambda_vec();
+
+  // gather (id, lambda) for all alchemical-pair atoms onto every rank
+  tagint *lid;  double *llam;
+  memory->create(lid,  (nlocal > 0 ? nlocal : 1), "alch/swap:lid");
+  memory->create(llam, (nlocal > 0 ? nlocal : 1), "alch/swap:llam");
+  int nloc = 0;
+  for (int i = 0; i < nlocal; i++) {
+    if (type[i] == type_A || type[i] == type_B) {
+      lid[nloc] = tag[i]; llam[nloc] = lambda[i]; nloc++;
+    }
+  }
+  const int nproc = comm->nprocs;
+  int *cnt = new int[nproc]; int *dsp = new int[nproc];
+  MPI_Allgather(&nloc, 1, MPI_INT, cnt, 1, MPI_INT, world);
+  int ntot = 0;
+  for (int p = 0; p < nproc; p++) { dsp[p] = ntot; ntot += cnt[p]; }
+  tagint *gid;  double *glam;
+  memory->create(gid,  (ntot > 0 ? ntot : 1), "alch/swap:gid");
+  memory->create(glam, (ntot > 0 ? ntot : 1), "alch/swap:glam");
+  MPI_Allgatherv(lid,  nloc, MPI_LMP_TAGINT, gid,  cnt, dsp, MPI_LMP_TAGINT, world);
+  MPI_Allgatherv(llam, nloc, MPI_DOUBLE,     glam, cnt, dsp, MPI_DOUBLE,     world);
+
+  // build pools by current lambda (endpoint atoms only; the single transiting
+  // atom of the switch schedule has 0<lambda<1 and is excluded from both)
+  int n1 = 0, n0 = 0;
+  for (int k = 0; k < ntot; k++) {
+    if (glam[k] > 0.999) n1++;
+    else if (glam[k] < 0.001) n0++;
+  }
+  tagint *pool1 = new tagint[n1 > 0 ? n1 : 1];
+  tagint *pool0 = new tagint[n0 > 0 ? n0 : 1];
+  int i1 = 0, i0 = 0;
+  for (int k = 0; k < ntot; k++) {
+    if (glam[k] > 0.999) pool1[i1++] = gid[k];
+    else if (glam[k] < 0.001) pool0[i0++] = gid[k];
+  }
+
+  const double kT = force->boltz * swap_temp;
+
+  if (n1 > 0 && n0 > 0) {
+    for (int s = 0; s < nswap; s++) {
+      nswap_attempt++;
+      // identical choices on all ranks
+      const int a = (int) (random->uniform() * n1);
+      const int b = (int) (random->uniform() * n0);
+      const tagint id1 = pool1[a < n1 ? a : n1 - 1];
+      const tagint id0 = pool0[b < n0 ? b : n0 - 1];
+
+      const double e_before = energy_full();
+      // swap: id1 -> 0, id0 -> 1
+      set_lambda(id1, 0.0);
+      set_lambda(id0, 1.0);
+      const double e_after = energy_full();
+      const double dE = e_after - e_before;
+
+      // accept/reject with a rank-identical random number
+      const double r = random->uniform();
+      bool accept = (dE <= 0.0) || (r < std::exp(-dE / kT));
+      if (accept) {
+        nswap_accept++;
+        // keep the swap; update the pools in place so subsequent attempts see it
+        pool1[a < n1 ? a : n1 - 1] = id0;   // id0 is now lambda=1
+        pool0[b < n0 ? b : n0 - 1] = id1;   // id1 is now lambda=0
+      } else {
+        set_lambda(id1, 1.0);   // revert
+        set_lambda(id0, 0.0);
+        comm->forward_comm(this);
+      }
+    }
+  }
+
+  delete[] pool1; delete[] pool0;
+  delete[] cnt; delete[] dsp;
+  memory->destroy(lid); memory->destroy(llam);
+  memory->destroy(gid); memory->destroy(glam);
+}
+
+/* ----------------------------------------------------------------------
    setup: build schedule, initialise all lambdas to their type endpoints,
    place the first switching atom at lambda=0 (its starting endpoint), and
    seed the trapezoid with the lambda=0 dedlam.
@@ -361,6 +494,11 @@ void FixAlchemicalSwitch::setup(int /*vflag*/)
 
 void FixAlchemicalSwitch::end_of_step()
 {
+  // PHASE 2: swap-MC cycle (independent of switch progress; runs during AND
+  // after switching so the configuration can equilibrate at fixed composition)
+  if (nswap > 0 && swap_every > 0 && (update->ntimestep % swap_every == 0))
+    attempt_swaps();
+
   if (nswitch == 0) return;
   if (nswitched >= nswitch) return;    // schedule complete
 
@@ -435,7 +573,10 @@ double FixAlchemicalSwitch::compute_vector(int n)
 {
   if (n == 0) return (double) nswitched;
   if (n == 1) return (double) nswitched / (double) N;
-  return (W_cum) / (double) N;    // F(x) over fully-switched atoms
+  if (n == 2) return (W_cum) / (double) N;    // F(x) over fully-switched atoms
+  if (n == 3) return (double) nswap_attempt;
+  if (n == 4) return (double) nswap_accept;
+  return nswap_attempt > 0 ? (double) nswap_accept / nswap_attempt : 0.0;  // accept ratio
 }
 
 /* ----------------------------------------------------------------------
