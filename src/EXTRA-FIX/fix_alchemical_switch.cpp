@@ -43,6 +43,7 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
   avg_flag = 0;
   order_random = 1;
   seed = 12345;
+  gsize = 1;            // atoms switched together per group (1 = sequential)
   nswap = 0;            // swap-MC off by default
   swap_every = 0;
   swap_temp = -1.0;     // <=0 -> use simulation temperature
@@ -67,6 +68,9 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
       iarg += 2;
     } else if (strcmp(arg[iarg], "nrelax") == 0) {
       nrelax = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "group") == 0) {
+      gsize = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
       iarg += 2;
     } else if (strcmp(arg[iarg], "seed") == 0) {
       seed = utils::inumeric(FLERR, arg[iarg + 1], false, lmp);
@@ -106,6 +110,7 @@ FixAlchemicalSwitch::FixAlchemicalSwitch(LAMMPS *lmp, int narg, char **arg) :
   if (xtarget < 0.0) error->all(FLERR, "fix alchemical/switch: 'xtarget <x>' required");
   if (nsub <= 0) error->all(FLERR, "fix alchemical/switch: 'nsub > 0' required");
   if (nrelax <= 0) error->all(FLERR, "fix alchemical/switch: 'nrelax > 0' required");
+  if (gsize <= 0) error->all(FLERR, "fix alchemical/switch: 'group >= 1' required");
   if (nswap > 0 && swap_every <= 0)
     error->all(FLERR, "fix alchemical/switch: nswap>0 requires swapevery>0");
   if (nswap > 0 && swap_temp <= 0.0)
@@ -308,16 +313,44 @@ void FixAlchemicalSwitch::set_lambda(tagint id, double val)
 }
 
 /* ----------------------------------------------------------------------
-   MPI-reduce the dedlam of the currently active atom: owner contributes its
-   value, all others contribute 0, sum is broadcast to all ranks.
+   number of atoms in the current group: gsize, except the last group may be
+   partial when nswitch is not a multiple of gsize.
+------------------------------------------------------------------------- */
+
+int FixAlchemicalSwitch::group_len() const
+{
+  int rem = nswitch - cur_atom;
+  return (rem < gsize) ? rem : gsize;
+}
+
+/* ----------------------------------------------------------------------
+   set d_lambda = val on every atom of the active group (shared lambda), then
+   refresh ghosts.
+------------------------------------------------------------------------- */
+
+void FixAlchemicalSwitch::set_group_lambda(double val)
+{
+  const int g = group_len();
+  for (int m = 0; m < g; m++) set_lambda(switch_order[cur_atom + m], val);
+  comm->forward_comm(this);
+}
+
+/* ----------------------------------------------------------------------
+   MPI-reduce the SUM of dedlam over the active group: each owner contributes
+   its members' values, all reduced and broadcast. For gsize=1 this is the
+   single active atom (unchanged behaviour).
 ------------------------------------------------------------------------- */
 
 double FixAlchemicalSwitch::active_dedlam()
 {
-  const tagint id = switch_order[cur_atom];
-  const int ilocal = atom->map(id);
+  const int g = group_len();
+  double *dl = dedlam();
+  const int nlocal = atom->nlocal;
   double local = 0.0;
-  if (ilocal >= 0 && ilocal < atom->nlocal) local = dedlam()[ilocal];
+  for (int m = 0; m < g; m++) {
+    const int ilocal = atom->map(switch_order[cur_atom + m]);
+    if (ilocal >= 0 && ilocal < nlocal) local += dl[ilocal];
+  }
   double global = 0.0;
   MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, world);
   return global;
@@ -468,17 +501,17 @@ void FixAlchemicalSwitch::setup(int /*vflag*/)
   if (out_file && comm->me == 0) {
     fp = fopen(out_file, "w");
     if (!fp) error->one(FLERR, "fix alchemical/switch: cannot open out file {}", out_file);
-    fprintf(fp, "# k atom lambda dedlam Wcum F\n");
+    fprintf(fp, "# nswitched group_size lambda dedlam Wcum F   "
+                "(one row per completed group; x=nswitched/N)\n");
   }
 
-  // the first atom begins at its starting endpoint:
+  // the first group begins at its starting endpoint:
   //   dir=+1 (A->B): start lambda=0; dir=-1 (B->A): start lambda=1.
   const double lam0 = (dir == +1) ? 0.0 : 1.0;
-  set_lambda(switch_order[cur_atom], lam0);
-  comm->forward_comm(this);
+  set_group_lambda(lam0);
 
   // need the pair style's dedlam at this state; the integrator will run a
-  // force eval for step 0. Seed the trapezoid baseline now.
+  // force eval for step 0. Seed the trapezoid baseline now (sum over the group).
   prev_lambda = lam0;
   prev_dedlam = active_dedlam();
   W_atom = 0.0;
@@ -522,13 +555,13 @@ void FixAlchemicalSwitch::end_of_step()
   dedlam_accum = 0.0;
   dedlam_nsamp = 0;
 
-  const tagint id = switch_order[cur_atom];
+  const int g = group_len();
 
-  // current lambda of the active atom (endpoint of the window we just ran)
+  // current (shared) lambda of the active group (endpoint of the window we ran)
   const double lam_now = (dir == +1) ? (double) cur_sub / nsub
                                      : 1.0 - (double) cur_sub / nsub;
 
-  // trapezoid increment from previous logged point to this one
+  // trapezoid increment of the SUMMED group dedlam over the common lambda
   if (cur_sub > 0) {
     const double dl = lam_now - prev_lambda;
     W_atom += 0.5 * (cur_dedlam + prev_dedlam) * dl;
@@ -536,34 +569,30 @@ void FixAlchemicalSwitch::end_of_step()
   prev_lambda = lam_now;
   prev_dedlam = cur_dedlam;
 
-  // log this point
-  if (fp && comm->me == 0) {
-    fprintf(fp, "%d " TAGINT_FORMAT " %.4f %.10g %.10g %.10g\n", nswitched + 1, id, lam_now,
-            cur_dedlam, W_cum + W_atom, (W_cum + W_atom) / (double) N);
-  }
-
   // advance
   if (cur_sub == nsub) {
-    // atom fully switched: commit its work, move to next atom
+    // group fully switched: commit its work and step the composition by g atoms.
+    // F(x) is logged ONLY here -> x lands on a whole-atom grid (g, 2g, ... /N).
     W_cum += W_atom;
-    nswitched++;
-    cur_atom++;
+    nswitched += g;
+    cur_atom += g;
     cur_sub = 0;
     W_atom = 0.0;
+    if (fp && comm->me == 0)
+      fprintf(fp, "%d %d %.4f %.10g %.10g %.10g\n", nswitched, g, 1.0,
+              cur_dedlam, W_cum, W_cum / (double) N);
     if (nswitched >= nswitch) return;
-    // place next atom at its starting endpoint
+    // place next group at its starting endpoint
     const double lam0 = (dir == +1) ? 0.0 : 1.0;
-    set_lambda(switch_order[cur_atom], lam0);
-    comm->forward_comm(this);
+    set_group_lambda(lam0);
     prev_lambda = lam0;
     prev_dedlam = active_dedlam();
   } else {
-    // advance this atom's lambda by one increment
+    // advance the whole group's shared lambda by one increment
     cur_sub++;
     const double lam_next = (dir == +1) ? (double) cur_sub / nsub
                                         : 1.0 - (double) cur_sub / nsub;
-    set_lambda(id, lam_next);
-    comm->forward_comm(this);
+    set_group_lambda(lam_next);
   }
 }
 

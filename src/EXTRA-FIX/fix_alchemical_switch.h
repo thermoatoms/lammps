@@ -22,8 +22,16 @@
 //   fix <id> <group> alchemical/switch <pairstyle> \
 //       pair <typeA> <typeB> xtarget <x> \
 //       nsub <n> nrelax <m> seed <s> \
-//       [order random|file <fname>] [avg yes|no] [out <fname>] \
+//       [group <g>] [order random|file <fname>] [avg yes|no] [out <fname>] \
 //       [nswap <N> swapevery <M> swaptemp <T_K>]
+//
+//   group <g> (default 1): switch g atoms together, sharing one lambda ramped
+//       0->1 simultaneously; integrate the SUMMED dE/dlambda over the g atoms
+//       vs the common lambda. F(x) is logged only at completed groups, so x
+//       lands on the whole-atom grid (g/N, 2g/N, ...). g=1 is the original
+//       one-at-a-time switch. CuAu test: F(x) robust to g at the few-meV level
+//       (g=1..4 all within seed/order scatter); g>1 coarsens the grid and does
+//       fewer ramp cycles. The last group may be partial if nswitch % g != 0.
 //
 //   PHASE 2 swap-MC (optional): every <M> steps attempt <N> Metropolis swaps
 //   of a lambda=1 <-> lambda=0 atom pair at fixed composition (exchange their
@@ -88,6 +96,7 @@ class FixAlchemicalSwitch : public Fix {
   double xtarget;            // target global mole fraction of species A
   int nsub;                  // lambda increments per atom
   int nrelax;                // MD steps between increments
+  int gsize;                 // atoms switched together per group (shared lambda)
   int seed;
 
   // PHASE 2 (swap-MC for configurational entropy): every `swap_every` steps,
@@ -131,9 +140,11 @@ class FixAlchemicalSwitch : public Fix {
   double *dedlam();          // fresh pointer from the pair style
   double *lambda_vec();      // fresh pointer to d_lambda
 
-  double active_dedlam();    // MPI_Allreduce'd <dE/dlambda> of the active atom
+  double active_dedlam();    // MPI_Allreduce'd sum of <dE/dlambda> over the active group
   void   set_lambda(tagint id, double val);   // set d_lambda on the owner
+  void   set_group_lambda(double val);        // set d_lambda on all atoms of the active group
   void   build_order();      // construct switch_order + direction
+  int    group_len() const;  // # atoms in the current group (handles the last partial group)
 
   // PHASE 2 swap-MC helpers
   void   attempt_swaps();    // one swap cycle of nswap Metropolis attempts
