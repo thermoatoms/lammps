@@ -15,10 +15,12 @@
 #include "error.h"
 #include "force.h"
 #include "group.h"
+#include "input.h"
 #include "memory.h"
 #include "pair.h"
 #include "random_mars.h"
 #include "update.h"
+#include "variable.h"
 
 #include <cmath>
 #include <cstring>
@@ -37,6 +39,11 @@ FixLambdaDynamics::FixLambdaDynamics(LAMMPS *lmp, int narg, char **arg) :
   if (m_lambda <= 0.0) error->all(FLERR, "fix lambda/dynamics mass must be > 0");
 
   k_bias = 0.0;
+  k_wall = 0.0;
+  wall_flag = false;
+  dmu = 0.0;
+  dmu_varname = nullptr;
+  dmu_var = -1;
   thermostat_flag = false;
   t_target = t_damp = 0.0;
   seed = 0;
@@ -45,6 +52,25 @@ FixLambdaDynamics::FixLambdaDynamics(LAMMPS *lmp, int narg, char **arg) :
   while (iarg < narg) {
     if (strcmp(arg[iarg], "bias") == 0) {
       k_bias = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      iarg += 2;
+    } else if (strcmp(arg[iarg], "confine") == 0) {
+      // confine wall <k_w> : edge-only half-harmonic walls (no interior barrier)
+      if (iarg + 2 >= narg) utils::missing_cmd_args(FLERR, "fix lambda/dynamics confine", error);
+      if (strcmp(arg[iarg + 1], "wall") != 0)
+        error->all(FLERR, "fix lambda/dynamics confine: only 'wall' is supported");
+      wall_flag = true;
+      k_wall = utils::numeric(FLERR, arg[iarg + 2], false, lmp);
+      if (k_wall <= 0.0) error->all(FLERR, "fix lambda/dynamics confine wall k must be > 0");
+      iarg += 3;
+    } else if (strcmp(arg[iarg], "mu") == 0) {
+      // semi-grand-canonical chemical-potential field -dmu * sum lambda
+      // accepts a constant OR an equal-style variable (mu v_name) ramped each step
+      if (iarg + 1 >= narg) utils::missing_cmd_args(FLERR, "fix lambda/dynamics mu", error);
+      if (strncmp(arg[iarg + 1], "v_", 2) == 0) {
+        dmu_varname = utils::strdup(arg[iarg + 1] + 2);
+      } else {
+        dmu = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      }
       iarg += 2;
     } else if (strcmp(arg[iarg], "temp") == 0) {
       thermostat_flag = true;
@@ -86,6 +112,7 @@ FixLambdaDynamics::~FixLambdaDynamics()
   atom->delete_callback(id, Atom::RESTART);
   memory->destroy(lam_state);
   delete random;
+  delete[] dmu_varname;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -109,6 +136,15 @@ void FixLambdaDynamics::init()
   if (!force->pair || !force->pair->extract_peratom("dedlam", ncol))
     error->all(FLERR, "fix lambda/dynamics requires a pair style providing per-atom "
                       "'dedlam' (e.g. grace/fs/alch)");
+
+  // resolve a time-varying dmu variable (mu v_name) if requested
+  if (dmu_varname) {
+    dmu_var = input->variable->find(dmu_varname);
+    if (dmu_var < 0)
+      error->all(FLERR, "fix lambda/dynamics mu variable {} does not exist", dmu_varname);
+    if (!input->variable->equalstyle(dmu_var))
+      error->all(FLERR, "fix lambda/dynamics mu variable {} must be equal-style", dmu_varname);
+  }
 
   reset_dt();
 }
@@ -149,17 +185,34 @@ void FixLambdaDynamics::post_force(int /*vflag*/)
   const double sigma =
       thermostat_flag ? sqrt(2.0 * boltz * t_target * m_lambda / (t_damp * dt)) : 0.0;
 
+  // time-varying chemical potential: evaluate the equal-style var this step
+  if (dmu_var >= 0) dmu = input->variable->compute_equal(dmu_var);
+
   double ebias_local = 0.0;
 
   for (int i = 0; i < nlocal; i++) {
     if (!(mask[i] & groupbit)) continue;
     const double lam = lambda[i];
 
-    // endpoint-localizing bias U = k_b * lam^2 (1-lam)^2
-    const double fbias = -2.0 * k_bias * lam * (1.0 - lam) * (1.0 - 2.0 * lam);
-    ebias_local += k_bias * lam * lam * (1.0 - lam) * (1.0 - lam);
+    // --- confinement to [0,1] (keep lambda off the FS |rho| kink) ---
+    double fconf = 0.0;
+    if (wall_flag) {
+      // edge-only half-harmonic walls: zero force inside [0,1]
+      if (lam < 0.0) {
+        fconf = -2.0 * k_wall * lam;                  // pushes up toward 0
+        ebias_local += k_wall * lam * lam;
+      } else if (lam > 1.0) {
+        fconf = -2.0 * k_wall * (lam - 1.0);          // pushes down toward 1
+        ebias_local += k_wall * (lam - 1.0) * (lam - 1.0);
+      }
+    } else {
+      // MSlD endpoint-localizing double well U = k_b * lam^2 (1-lam)^2
+      fconf = -2.0 * k_bias * lam * (1.0 - lam) * (1.0 - 2.0 * lam);
+      ebias_local += k_bias * lam * lam * (1.0 - lam) * (1.0 - lam);
+    }
 
-    double f = -dEdl[i] + fbias;
+    // semi-grand-canonical field: U = -dmu * lambda -> force +dmu
+    double f = -dEdl[i] + fconf + dmu;
     if (thermostat_flag) f += -gamma * lam_state[i][0] + sigma * random->gaussian();
     lam_state[i][1] = f;
   }

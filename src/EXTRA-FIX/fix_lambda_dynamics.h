@@ -10,12 +10,28 @@
 
 //
 // fix lambda/dynamics — velocity-Verlet integration of per-atom alchemical
-// variables (lambda_i, v_i) with a global mass m_lambda, an MSlD-style
-// endpoint-localizing bias U_b = k_b * lambda^2 (1-lambda)^2, and an
-// optional Langevin thermostat on the lambda subsystem.
+// variables (lambda_i, v_i) with a global mass m_lambda, confinement of
+// lambda to [0,1], an optional semi-grand-canonical chemical-potential
+// field, and an optional Langevin thermostat on the lambda subsystem.
 //
 //   fix <id> <group> lambda/dynamics <m_lambda> [bias <k_b>]
+//                                    [confine wall <k_w>]
+//                                    [mu <dmu>]
 //                                    [temp <T> <tau> <seed>]
+//
+// Confinement modes (keep lambda off the FS |rho| kink outside [0,1]):
+//   bias <k_b>        : MSlD endpoint-localizing double well
+//                       U = k_b * lambda^2 (1-lambda)^2 (interior barrier).
+//   confine wall <k_w>: edge-only half-harmonic walls at 0 and 1,
+//                       U = k_w * lambda^2 (lambda<0) or k_w*(lambda-1)^2
+//                       (lambda>1), ZERO force inside [0,1] -> lambda flows
+//                       freely (for smooth dmu-driven composition response).
+// mu <dmu> | mu v_name : semi-grand-canonical field -dmu * sum_i lambda_i;
+//   adds force +dmu on each lambda. At equilibrium dmu = <dF/dx>, so a dmu
+//   sweep traces dF/dx vs composition x = <sum lambda / N>. With an
+//   equal-style variable (mu v_name, e.g. v_name = ramp(mu0,mu1)) dmu is
+//   ramped continuously DURING one run -> the whole x(dmu)=dF/dx curve from
+//   a single trajectory (NEHI-style; use forward+backward for dissipation).
 //
 // lambda lives in fix property/atom d_lambda (ghost yes, defined BEFORE
 // this fix); dE/dlambda comes from the pair style via
@@ -68,7 +84,12 @@ class FixLambdaDynamics : public Fix {
 
  protected:
   double m_lambda;     // mass of the lambda DOF, eV*ps^2
-  double k_bias;       // endpoint bias strength, eV
+  double k_bias;       // endpoint double-well bias strength, eV (confine=bias)
+  double k_wall;       // edge half-harmonic wall strength, eV (confine=wall)
+  bool   wall_flag;    // true: edge-only walls; false: quartic bias
+  double dmu;          // semi-grand-canonical chemical-potential field, eV
+  char  *dmu_varname;  // if set, dmu read each step from this equal-style var
+  int    dmu_var;      // resolved variable index (-1 if dmu is constant)
   double t_target;     // Langevin temperature, K (thermostat_flag only)
   double t_damp;       // Langevin damping time, ps
   int seed;
