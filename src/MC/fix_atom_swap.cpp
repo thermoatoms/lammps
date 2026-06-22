@@ -558,9 +558,6 @@ void FixAtomSwap::init()
     if (nswap_count > 1)
       error->all(FLERR, Error::NOLASTLINE,
                  "Fix atom/swap localE is not compatible with swap_count > 1");
-    if (semi_grand_flag)
-      error->all(FLERR, Error::NOLASTLINE,
-                 "Fix atom/swap localE is not compatible with semi-grand");
     if (unequal_cutoffs)
       error->all(FLERR, Error::NOLASTLINE,
                  "Fix atom/swap localE is not compatible with unequal type cutoffs");
@@ -594,6 +591,15 @@ void FixAtomSwap::init()
                             "localE optimization disabled (no-op)\n");
       local_energy_flag = 0;
     }
+
+    // semi-grand localE supports only the single plain-PACE fast path;
+    // the hybrid/scaled split-cache machinery is specific to (non-semi-grand)
+    // alchemical TI runs.
+    if (local_energy_flag && semi_grand_flag &&
+        !(pace_substyles.size() == 1 && pace_substyles[0].second == 1.0))
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Fix atom/swap localE with semi-grand requires a single "
+                 "pair_style pace (no hybrid/scaled)");
 
     // pre-allocate the per-atom energy cache
     if (atom->nlocal > eatom_cached_nmax) {
@@ -789,7 +795,7 @@ int FixAtomSwap::attempt_semi_grand()
 
   // pick a random atom and perform swap
 
-  int itype, jtype, jswaptype;
+  int itype = -1, jtype = -1, jswaptype;
   int i = pick_semi_grand_atom();
   if (i >= 0) {
     jswaptype = static_cast<int>(nswaptypes * random_unequal->uniform());
@@ -800,6 +806,13 @@ int FixAtomSwap::attempt_semi_grand()
       jtype = type_list[jswaptype];
     }
     atom->type[i] = jtype;
+  }
+
+  // for localE: broadcast the global tag of the selected atom to all ranks
+  tagint tag_i_global = 0;
+  if (local_energy_flag) {
+    tagint tag_send = (i >= 0) ? atom->tag[i] : (tagint) 0;
+    MPI_Allreduce(&tag_send, &tag_i_global, 1, MPI_LMP_TAGINT, MPI_SUM, world);
   }
 
   // if unequal_cutoffs, call comm->borders() and rebuild neighbor list
@@ -817,10 +830,23 @@ int FixAtomSwap::attempt_semi_grand()
     comm->forward_comm(this);
   }
 
-  // post-swap energy
+  // post-swap energy: local shell approximation (localE) or full pair compute
+  // for localE, semi-grand uses the single plain-PACE fast path (enforced in
+  // init), with the single selected atom passed as tag_i and tag_j = 0
 
-  if (force->kspace) force->kspace->qsum_qsq();
-  double energy_after = energy_full();
+  double energy_after;
+  std::vector<std::pair<int, double>> changed_atoms;
+
+  if (local_energy_flag) {
+    double local_dE = pace_substyles[0].first->compute_shell_delta(
+        tag_i_global, (tagint) 0, eatom_cached, changed_atoms);
+    double total_dE;
+    MPI_Allreduce(&local_dE, &total_dE, 1, MPI_DOUBLE, MPI_SUM, world);
+    energy_after = energy_stored + total_dE;
+  } else {
+    if (force->kspace) force->kspace->qsum_qsq();
+    energy_after = energy_full();
+  }
 
   int success = 0;
   if (i >= 0)
@@ -835,6 +861,9 @@ int FixAtomSwap::attempt_semi_grand()
 
   if (success_all) {
     update_semi_grand_atoms_list();
+    // update per-atom energy cache with recomputed shell energies
+    if (local_energy_flag)
+      for (auto &[idx, new_e] : changed_atoms) eatom_cached[idx] = new_e;
     energy_stored = energy_after;
     if (ke_flag) {
       if (i >= 0) {
@@ -857,6 +886,9 @@ int FixAtomSwap::attempt_semi_grand()
 
   if (i >= 0) atom->type[i] = itype;
   if (force->kspace) force->kspace->qsum_qsq();
+
+  // re-sync ghost types after rejected swap so next trial sees correct types
+  if (local_energy_flag && !unequal_cutoffs) comm->forward_comm(this);
 
   return 0;
 }

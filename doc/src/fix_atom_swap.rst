@@ -197,12 +197,21 @@ own neighbour shell.  The cache is updated incrementally on accepted
 swaps and rebuilt from scratch at the start of each MC block.
 
 This option is currently supported only with *pair_style pace* and
-requires *swap_count* = 1 and *semi-grand* = no.  It is not compatible
-with unequal pair cutoffs between the swap types.  On parallel runs,
-a single ``MPI_Allreduce`` per trial replaces the full pair compute
-reduction.  The expected speedup over *noforce yes* is proportional to
-N / Z, where N is the number of atoms and Z is the coordination number
-(typically 50-80x for a 4000-atom system).
+requires *swap_count* = 1.  It is not compatible with unequal pair
+cutoffs between the swap types.  On parallel runs, a single
+``MPI_Allreduce`` per trial replaces the full pair compute reduction.
+The expected speedup over *noforce yes* is proportional to N / Z, where
+N is the number of atoms and Z is the coordination number (typically
+50-80x for a 4000-atom system).
+
+The *localE* optimization works in both the regular (composition-conserving
+pair-swap) mode and in *semi-grand* = yes mode.  In semi-grand mode each
+trial changes the type of a single atom, and the local shell delta is
+combined with the chemical-potential term :math:`\mu_j - \mu_i` exactly as
+in the full-energy path, so the accept/reject statistics are unchanged --
+only the energy evaluation is accelerated.  In semi-grand mode *localE*
+requires a single ``pair_style pace`` (the hybrid/scaled split-cache path
+is only available in the regular pair-swap mode).
 
 .. versionadded:: TBD
 
