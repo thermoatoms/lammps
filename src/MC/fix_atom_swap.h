@@ -104,6 +104,18 @@ class FixAtomSwap : public Fix {
   double adapt_mu_lo;       // lower hard bound on adaptive mu (-DBL_MAX by default = no bound)
   double adapt_mu_hi;       // upper hard bound on adaptive mu (+DBL_MAX by default = no bound)
 
+  // variance-constrained semi-grand (VC-SGC, Sadigh PRB 2012). When vsgc_flag,
+  // a harmonic composition-variance penalty is added to the semi-grand swap
+  // acceptance, holding the GLOBAL composition near target_conc[]. Lets the swap
+  // sit at intermediate / two-phase-gap compositions that plain SGC avalanches
+  // through, while keeping localE + noforce + parallel (unlike LAMMPS fix sgcmc,
+  // whose fast path is EAM-only). species_count[] is the live global per-type atom
+  // count, seeded each block and updated incrementally on accepted swaps.
+  int vsgc_flag;            // 1 if variance constraint active
+  double vsgc_kappa;        // variance constraint parameter kappa
+  double *vsgc_target;      // per-type target concentration c0 (1-based, size ntypes+1)
+  double *species_count;    // live global atom count per type (1-based)
+
   double nswap_attempts;
   double nswap_successes;
 
@@ -141,6 +153,7 @@ class FixAtomSwap : public Fix {
   int pick_j_swap_atom();
   void update_semi_grand_atoms_list();
   void update_swap_atoms_list();
+  void seed_species_count();   // VC-SGC: seed live global per-type counts
 };
 
 }    // namespace LAMMPS_NS

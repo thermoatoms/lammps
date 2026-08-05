@@ -17,7 +17,7 @@ Syntax
 * seed = random # seed (positive integer)
 * T = scaling temperature of the MC swaps (temperature units, or equal-style variable v_name)
 * one or more keyword/value pairs may be appended to args
-* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE* or *adapt*
+* keyword = *types* or *mu* or *ke* or *semi-grand* or *region* or *swap_count* or *noforce* or *localE* or *adapt* or *variance*
 
   .. parsed-literal::
 
@@ -46,6 +46,9 @@ Syntax
          *tracked* value = 1 or 2 — which of the two listed types has its mu driven (default 2)
          *mumin* value = hard lower bound on the adaptive mu value (energy units, default: none)
          *mumax* value = hard upper bound on the adaptive mu value (energy units, default: none)
+       *variance* values = kappa c0_1 [c0_2 ...]
+         kappa = variance constraint parameter (energy units, >= 0)
+         c0_i = target concentration of the i-th type listed under *types* (0 to 1)
 
 Examples
 """"""""
@@ -59,6 +62,7 @@ Examples
    fix adaptSGMC all atom/swap 10 200 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 adapt 0.02 10 maxdmu 2.0 mumin -15.0 mumax 5.0
    fix multiSwap all atom/swap 1 1 29494 300.0 types 1 2 swap_count 5   fix fastSwap all atom/swap 1 1 29494 300.0 types 1 2 noforce yes
    fix localSwap all atom/swap 100 100 12 800 ke no types 1 2 localE yes
+   fix vcsgc all atom/swap 10 100 345 1.0 semi-grand yes types 1 2 mu 0.0 -3.0 variance 2000.0 0.75 0.25
 
 Description
 """""""""""
@@ -263,6 +267,57 @@ and can be monitored via :doc:`thermo_style custom <thermo_style>`.
 The *adapt* keyword is not compatible with variable-backed mu (``v_``
 syntax) for the driven type, nor with ``swap_count > 1``.
 
+.. versionadded:: TBD
+
+The *variance* keyword activates the variance-constrained semi-grand
+canonical (VC-SGC) ensemble of :ref:`(Sadigh) <Sadigh>`.  It is only
+compatible with *semi-grand yes*, and must appear after the *types*
+keyword.  One target concentration :math:`c^0_t` is given per swap type,
+in the same order as the types listed under *types*.
+
+In the plain semi-grand canonical ensemble the composition is controlled
+only indirectly, through the chemical potential differences.  Inside a
+two-phase region the free energy is non-convex in composition, so there
+is no chemical potential that stabilizes an intermediate composition:
+the system avalanches to one of the two terminal phases and the
+intermediate compositions of the miscibility gap are never sampled.  The
+VC-SGC ensemble removes this by adding a harmonic penalty on the global
+composition to the semi-grand Hamiltonian,
+
+.. math::
+
+   H_\mathrm{VC-SGC} = H_\mathrm{SGC}
+     + \frac{\kappa}{N} \sum_t \left( N_t - c^0_t N \right)^2
+
+where :math:`N_t` is the current global number of atoms of type *t*,
+:math:`N` is the total number of atoms in the system, and :math:`\kappa`
+is the constraint strength in energy units.  Each trial type change
+contributes the exact finite change of this penalty to the Metropolis
+exponent, with the same sign as the energy cost, so trials that move the
+global composition away from the target are suppressed.  The composition
+is constrained but still free to fluctuate; the width of the fluctuation
+is set by :math:`\kappa`.  Large :math:`\kappa` pins the composition
+tightly at :math:`c^0` and approaches the canonical ensemble, while
+:math:`\kappa \to 0` recovers plain semi-grand behavior.  Scanning
+:math:`c^0` across the miscibility gap therefore traces out the
+intermediate two-phase states directly.
+
+The constraint acts on the **global** composition, not on any local
+region, so an interface-containing two-phase configuration at the target
+average composition is a valid sampled state.  The per-type counts are
+computed once per MC block by a global reduction and then updated
+incrementally on each accepted swap, so no extra communication is
+required per trial.
+
+Unlike :doc:`fix sgcmc <fix_sgcmc>`, which also implements VC-SGC but
+whose optimized path is restricted to EAM potentials, this
+implementation works with any pair style and composes with the *localE*,
+*noforce*, and parallel (MPI) paths of this fix.
+
+The live global concentrations of the first two listed swap types are
+available as ``f_ID[6]`` and ``f_ID[7]`` for monitoring the constraint,
+and are reported whether or not *variance* is active.
+
 You should ensure you do not swap atoms belonging to a molecule, or
 LAMMPS will eventually generate an error when it tries to find those
 atoms.  LAMMPS will warn you if any of the atoms eligible for swapping
@@ -356,7 +411,7 @@ uninterrupted fashion.
 None of the :doc:`fix_modify <fix_modify>` options are relevant to this
 fix.
 
-This fix computes a global vector of length 5, which can be accessed
+This fix computes a global vector of length 7, which can be accessed
 by various :doc:`output commands <Howto_output>`.  The vector values are
 the following global quantities:
 
@@ -365,6 +420,11 @@ the following global quantities:
   #. current composition :math:`X` of the tracked type (0 when *adapt* is not active)
   #. current susceptibility :math:`\chi = \beta\,\mathrm{Var}(N_2)/N` (0 when *adapt* is not active)
   #. current value of the adaptive mu (0 when *adapt* is not active)
+  #. current global concentration of the first type listed under *types*
+  #. current global concentration of the second type listed under *types* (0 if only one type is listed)
+
+The last two values are computed on demand by a global type count, so
+they are valid at any output step, with or without *variance* active.
 
 The vector values calculated by this fix are "intensive".
 
@@ -400,7 +460,8 @@ Default
 """""""
 
 The option defaults are *ke* = yes, *semi-grand* = no, *mu* = 0.0 for
-all atom types, *swap_count* = 1, *noforce* = no, *localE* = no.
+all atom types, *swap_count* = 1, *noforce* = no, *localE* = no,
+*variance* = off.
 
 ----------
 

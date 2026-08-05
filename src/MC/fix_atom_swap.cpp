@@ -70,7 +70,8 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   dynamic_group_allow = 1;
 
   vector_flag = 1;
-  size_vector = 5;    // [0]=attempts [1]=successes [2]=X [3]=chi [4]=mu_adapt
+  size_vector = 7;    // [0]=attempts [1]=successes [2]=X [3]=chi [4]=mu_adapt
+                      // [5]=c_type1 [6]=c_type2 (live global concentrations, VC-SGC)
   global_freq = 1;
   extvector = 0;
   restart_global = 1;
@@ -132,6 +133,12 @@ FixAtomSwap::FixAtomSwap(LAMMPS *lmp, int narg, char **arg) :
   adapt_x_current = 0.0;
   adapt_chi_current = 0.0;
   adapt_mu_current = 0.0;
+
+  // variance-constrained semi-grand defaults (disabled)
+  vsgc_flag = 0;
+  vsgc_kappa = 0.0;
+  vsgc_target = nullptr;
+  species_count = nullptr;
 
   // default value for multi-swap count
   nswap_count = 1;
@@ -208,6 +215,8 @@ FixAtomSwap::~FixAtomSwap()
   memory->destroy(eatom_cached);
   memory->destroy(eatom_sA);
   memory->destroy(eatom_sB);
+  memory->destroy(vsgc_target);
+  memory->destroy(species_count);
 }
 
 /* ----------------------------------------------------------------------
@@ -319,9 +328,42 @@ void FixAtomSwap::options(int narg, char **arg)
         } else
           break;
       }
+    } else if (strcmp(arg[iarg], "variance") == 0) {
+      // variance kappa c0_1 [c0_2 ...]: one target concentration per swap type,
+      // in the SAME order as the `types` list. Holds the global composition near
+      // these targets via a harmonic variance penalty (VC-SGC). Only meaningful
+      // with semi-grand yes.
+      // `types` must be parsed first (like mu/adapt, which also use type_list)
+      if (nswaptypes < 1)
+        error->all(FLERR, "Fix atom/swap variance keyword must come after types");
+      // consumes: keyword + kappa + nswaptypes targets
+      if (iarg + 2 + nswaptypes > narg)
+        error->all(FLERR, "Illegal fix atom/swap variance: need kappa + one "
+                          "target concentration per swap type");
+      vsgc_flag = 1;
+      vsgc_kappa = utils::numeric(FLERR, arg[iarg + 1], false, lmp);
+      if (vsgc_kappa < 0.0)
+        error->all(FLERR, "Illegal fix atom/swap variance kappa: must be >= 0");
+      // allocate per-type target array (1-based, ntypes+1)
+      memory->create(vsgc_target, atom->ntypes + 1, "MCSWAP:vsgc_target");
+      for (int t = 0; t <= atom->ntypes; t++) vsgc_target[t] = 0.0;
+      double csum = 0.0;
+      for (int s = 0; s < nswaptypes; s++) {
+        double c0 = utils::numeric(FLERR, arg[iarg + 2 + s], false, lmp);
+        if (c0 < 0.0 || c0 > 1.0)
+          error->all(FLERR, "Illegal fix atom/swap variance target: must be in [0,1]");
+        vsgc_target[type_list[s]] = c0;
+        csum += c0;
+      }
+      if (csum > 1.0 + 1.0e-6)
+        error->all(FLERR, "Illegal fix atom/swap variance: target concentrations sum > 1");
+      iarg += 2 + nswaptypes;   // keyword + kappa + nswaptypes targets
     } else
       error->all(FLERR, "Illegal fix atom/swap command");
   }
+
+  if (vsgc_flag && !semi_grand_flag)
+    error->all(FLERR, "Fix atom/swap variance constraint requires semi-grand yes");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -701,6 +743,7 @@ void FixAtomSwap::pre_exchange()
   int nsuccess = 0;
   if (semi_grand_flag) {
     update_semi_grand_atoms_list();
+    if (vsgc_flag) seed_species_count();
     for (int i = 0; i < ncycles; i++) nsuccess += attempt_semi_grand();
   } else {
     update_swap_atoms_list();
@@ -848,14 +891,46 @@ int FixAtomSwap::attempt_semi_grand()
     energy_after = energy_full();
   }
 
+  // VC-SGC variance penalty (Sadigh PRB 2012, Eq. 20). The swap removes one
+  // itype atom and adds one jtype atom. With c0 = target concentration and
+  // n_t = species_count[t] (current global count), the change in the harmonic
+  // variance term  (kappa/N) * sum_t (n_t - c0_t*N)^2  for this single swap is
+  //   dVar = (kappa/N) * [ (2*n_j + 1 - 2*c0_j*N) - (2*n_i - 1 - 2*c0_i*N) ]
+  // added INSIDE the Metropolis exponent with the same sign as the energy cost
+  // (i.e. -beta*dVar), so accepting a swap that moves AWAY from target is
+  // penalised. species_count holds the GLOBAL count (identical on every rank),
+  // so this is computed identically wherever evaluated. Evaluated on the owning
+  // rank (i>=0), where itype/jtype are valid.
   int success = 0;
-  if (i >= 0)
+  if (i >= 0) {
+    double dvsgc = 0.0;
+    if (vsgc_flag) {
+      double Ntot = (double) atom->natoms;
+      double nj = species_count[jtype];
+      double ni = species_count[itype];
+      dvsgc = (vsgc_kappa / Ntot) *
+              ( (2.0 * nj + 1.0 - 2.0 * vsgc_target[jtype] * Ntot)
+              - (2.0 * ni - 1.0 - 2.0 * vsgc_target[itype] * Ntot) );
+    }
     if (random_unequal->uniform() <
-        exp(beta * (energy_before - energy_after + mu[jtype] - mu[itype])))
+        exp(beta * (energy_before - energy_after + mu[jtype] - mu[itype] - dvsgc)))
       success = 1;
+  }
 
   int success_all = 0;
   MPI_Allreduce(&success, &success_all, 1, MPI_INT, MPI_MAX, world);
+
+  // VC-SGC: on an accepted swap, update the live global species_count on EVERY
+  // rank (the count is global/replicated). Broadcast the accepted swap's
+  // (itype,jtype) from the owning rank — only that rank has them.
+  if (vsgc_flag && success_all) {
+    int ij_local[2] = {0, 0};
+    if (i >= 0) { ij_local[0] = itype; ij_local[1] = jtype; }
+    int ij_global[2] = {0, 0};
+    MPI_Allreduce(ij_local, ij_global, 2, MPI_INT, MPI_MAX, world);
+    species_count[ij_global[0]] -= 1.0;   // itype lost one
+    species_count[ij_global[1]] += 1.0;   // jtype gained one
+  }
 
   // swap accepted, return 1
 
@@ -1267,6 +1342,29 @@ int FixAtomSwap::pick_j_swap_atom()
    update the list of gas atoms
 ------------------------------------------------------------------------- */
 
+/* ----------------------------------------------------------------------
+   VC-SGC: seed the live global per-type atom count once at the start of an
+   MC block. species_count[t] is then kept current by incremental ±1 updates
+   on each accepted swap inside attempt_semi_grand (every rank applies the same
+   update after the MPI-synced acceptance), so no per-swap global reduction is
+   needed. 1-based over atom types.
+------------------------------------------------------------------------- */
+
+void FixAtomSwap::seed_species_count()
+{
+  if (species_count == nullptr)
+    memory->create(species_count, atom->ntypes + 1, "MCSWAP:species_count");
+  std::vector<int> local(atom->ntypes + 1, 0);
+  int *type = atom->type;
+  for (int i = 0; i < atom->nlocal; i++)
+    if (type[i] >= 1 && type[i] <= atom->ntypes) local[type[i]]++;
+  std::vector<int> global(atom->ntypes + 1, 0);
+  MPI_Allreduce(local.data(), global.data(), atom->ntypes + 1, MPI_INT, MPI_SUM, world);
+  for (int t = 0; t <= atom->ntypes; t++) species_count[t] = (double) global[t];
+}
+
+/* ---------------------------------------------------------------------- */
+
 void FixAtomSwap::update_semi_grand_atoms_list()
 {
   int nlocal = atom->nlocal;
@@ -1434,6 +1532,21 @@ double FixAtomSwap::compute_vector(int n)
   if (n == 2) return adapt_x_current;
   if (n == 3) return adapt_chi_current;
   if (n == 4) return adapt_mu_current;
+  // [5],[6] = live global concentration of type_list[0], type_list[1] (VC-SGC).
+  // Computed on demand by a global type count so it is valid even between MC
+  // blocks and without the variance constraint active.
+  if ((n == 5 || n == 6) && nswaptypes >= 1) {
+    int want = (n == 5) ? type_list[0] : (nswaptypes >= 2 ? type_list[1] : -1);
+    if (want < 1) return 0.0;
+    int nloc = 0;
+    int *type = atom->type;
+    for (int i = 0; i < atom->nlocal; i++)
+      if (type[i] == want) nloc++;
+    int nglob = 0;
+    MPI_Allreduce(&nloc, &nglob, 1, MPI_INT, MPI_SUM, world);
+    double Ntot = (double) atom->natoms;
+    return (Ntot > 0.0) ? (double) nglob / Ntot : 0.0;
+  }
   return 0.0;
 }
 
