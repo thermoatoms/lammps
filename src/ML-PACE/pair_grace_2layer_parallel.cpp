@@ -517,7 +517,9 @@ void PairGRACE2LayerParallel::compute(int eflag, int vflag)
 
   model2_timer.start();
   run_backward_layer_2(eflag, vflag);
-  bool do_energy_only = flag_compute_energy_only && !debug_no_energy_only_calc;
+  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
+  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
+  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
 
   model2_timer.stop();
 
@@ -910,7 +912,9 @@ void PairGRACE2LayerParallel::run_backward_layer_2(int eflag, int vflag)
   std::vector<std::string> out_names;
   std::vector<std::string> ordered_keys;
 
-  bool do_energy_only = flag_compute_energy_only && !debug_no_energy_only_calc;
+  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
+  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
+  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
 
   // Energy
   if (sig.outputs.count(ENERGY_KEY)) {

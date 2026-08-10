@@ -1231,28 +1231,19 @@ int FixAtomSwap::attempt_swap()
 
 double FixAtomSwap::energy_full()
 {
-  int eflag = 1;
+  // an MC trial needs the potential energy only, so with noforce the ENERGY_ONLY
+  // bit is passed down and pair styles that support it (pace, eam, grace) skip
+  // force accumulation.  hybrid and hybrid/scaled forward eflag to their
+  // sub-styles unchanged, so the bit reaches those too.  forces are left
+  // undefined afterwards, which is harmless: the next MD step recomputes them.
+
+  int eflag = ENERGY_GLOBAL;
+  if (noforce_flag) eflag |= ENERGY_ONLY;
   int vflag = 0;
 
   if (modify->n_pre_force) modify->pre_force(vflag);
 
-  if (noforce_flag && force->pair) {
-    auto *hybrid = dynamic_cast<PairHybrid *>(force->pair);
-    if (hybrid) {
-      for (int s = 0; s < hybrid->nstyles; s++) hybrid->styles[s]->energy_only = 1;
-    } else {
-      force->pair->energy_only = 1;
-    }
-  }
   if (force->pair) force->pair->compute(eflag, vflag);
-  if (noforce_flag && force->pair) {
-    auto *hybrid = dynamic_cast<PairHybrid *>(force->pair);
-    if (hybrid) {
-      for (int s = 0; s < hybrid->nstyles; s++) hybrid->styles[s]->energy_only = 0;
-    } else {
-      force->pair->energy_only = 0;
-    }
-  }
 
   if (atom->molecular != Atom::ATOMIC) {
     if (force->bond) force->bond->compute(eflag, vflag);

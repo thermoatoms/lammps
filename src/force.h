@@ -26,7 +26,7 @@ class Improper;
 class KSpace;
 class Pair;
 
-enum { ENERGY_NONE = 0x00, ENERGY_GLOBAL = 0x01, ENERGY_ATOM = 0x02 };
+enum { ENERGY_NONE = 0x00, ENERGY_GLOBAL = 0x01, ENERGY_ATOM = 0x02, ENERGY_ONLY = 0x04 };
 
 // clang-format off
 enum {

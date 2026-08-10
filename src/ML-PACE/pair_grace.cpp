@@ -514,7 +514,9 @@ void PairGRACE::compute(int eflag, int vflag)
   // the pointer to the list of neighbors of "i"
   firstneigh = list->firstneigh;
 
-  bool do_energy_only = flag_compute_energy_only && !debug_no_energy_only_calc;
+  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
+  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
+  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
 
   auto compute_inputs_sig = graceimpl->compute_inputs_sig;
   if (do_energy_only) {

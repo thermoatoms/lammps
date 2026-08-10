@@ -181,7 +181,7 @@ void PairPACE::compute(int eflag, int vflag)
     // jlist(neigh ind of 0-atom) = [1,2,10,7,99,25, .. 50 element in total]
 
     try {
-      aceimpl->ace->energy_only = (energy_only != 0);
+      aceimpl->ace->energy_only = (eflag_only != 0);
       aceimpl->ace->compute_atom(i, x, type, jnum, jlist);
     } catch (std::exception &e) {
       error->one(FLERR, e.what());
@@ -192,7 +192,7 @@ void PairPACE::compute(int eflag, int vflag)
 
     // 'compute_atom' will update the `aceimpl->ace->e_atom` and `aceimpl->ace->neighbours_forces(jj, alpha)` arrays
 
-    if (!energy_only) {
+    if (!eflag_only) {
       for (jj = 0; jj < jnum; jj++) {
         j = jlist[jj];
         j &= NEIGHMASK;

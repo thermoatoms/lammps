@@ -310,7 +310,7 @@ void PairEAM::compute(int eflag, int vflag)
         recip = 1.0/r;
         phi = z2*recip;
         if (eflag) evdwl = scale[itype][jtype]*phi;
-        if (!energy_only) {
+        if (!eflag_only) {
           phip = z2p*recip - phi*recip;
           psip = fp[i]*rhojp + fp[j]*rhoip + phip;
           fpair = -scale[itype][jtype]*psip*recip;

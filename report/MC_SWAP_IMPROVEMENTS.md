@@ -33,25 +33,43 @@ During an MC trial, forces are irrelevant — only the scalar potential energy m
 For ACE/PACE potentials, the force loop (back-propagation through the ACE basis
 gradients to produce `neighbours_forces`) is computationally expensive. 
 
-### LAMMPS implementation (`pair.h`, `pair.cpp`)
+### LAMMPS implementation (`force.h`, `pair.h`, `pair.cpp`)
 
-A new integer flag `energy_only` was added to the `Pair` base class (initialized to 0).
-When set to 1 by the fix before calling `compute()`, individual pair styles can inspect
-it and skip their force-accumulation loops.
+The request travels as an extra bit in the existing `eflag` word, alongside
+`ENERGY_GLOBAL` and `ENERGY_ATOM`, rather than as a side-channel member poked by the
+fix:
 
 ```cpp
-// pair.h
-int energy_only;  // flag: skip force accumulation (MC energy-only eval)
+// force.h
+enum { ENERGY_NONE = 0x00, ENERGY_GLOBAL = 0x01, ENERGY_ATOM = 0x02, ENERGY_ONLY = 0x04 };
 ```
+
+```cpp
+// pair.cpp, Pair::ev_setup()  (reached by every pair style through ev_init)
+eflag_only = eflag_global ? (eflag & ENERGY_ONLY) : 0;
+```
+
+A pair style that can skip its force loop inspects `eflag_only`; one that cannot ignores
+the bit and computes forces as usual, so the flag is never wrong, only unused.  Because
+`ev_setup` derives it afresh on every `compute()` call there is no state to restore
+afterwards, and `hybrid` / `hybrid/scaled` forward `eflag` to their sub-styles unchanged,
+so the bit reaches those without the fix having to know about them.
 
 ```cpp
 // fix_atom_swap.cpp, energy_full()
-if (noforce_flag && force->pair) force->pair->energy_only = 1;
-force->pair->compute(eflag, vflag);
-if (noforce_flag && force->pair) force->pair->energy_only = 0;
+int eflag = ENERGY_GLOBAL;
+if (noforce_flag) eflag |= ENERGY_ONLY;
+if (force->pair) force->pair->compute(eflag, vflag);
 ```
 
-The flag is always restored to 0 after the call so normal MD force steps are unaffected.
+Forces are left undefined after an energy-only call, which is harmless here: the next MD
+step recomputes them.
+
+This is deliberately the same spelling LAMMPS itself adopted after this fork was taken
+(`ENERGY_ONLY`, `Pair::eflag_only`), so code written against either tree compiles against
+both.  Styles that honor it here: `pace`, `eam`, and all `grace` variants (the GRACE
+styles also accept `extract("compute_energy_only")` as an explicit override, for callers
+that set the flag directly rather than through `eflag`).
 
 
 ### ACE/PACE implementation — changes to the ACE fork
@@ -95,12 +113,14 @@ applied to the equivalent force loop in the recursive evaluator path.
 **`pair_pace.cpp` — propagation of the flag:**
 
 ```cpp
-aceimpl->ace->energy_only = (energy_only != 0);
+aceimpl->ace->energy_only = (eflag_only != 0);
 aceimpl->ace->compute_atom(i, x, type, jnum, jlist);
 ```
 
 The force accumulation loop on the LAMMPS side (reading back `neighbours_forces` and
-applying to `f[i]`, `f[j]`) was also guarded with `if (!energy_only)`.
+applying to `f[i]`, `f[j]`) was also guarded with `if (!eflag_only)`.  Note the two
+spellings: `eflag_only` is the LAMMPS-side request bit, `ACEEvaluator::energy_only` is
+the evaluator's own switch that it sets.
 
 ### Validation
 
@@ -248,11 +268,10 @@ The key benefit: swapping two atoms cannot change `eatom_sA[i]` for the type-inv
 
 **`noforce yes` propagation through hybrid**
 
-When `noforce yes` is active, `energy_full()` now walks all `hybrid->styles[]` and sets
-`energy_only = 1` on each sub-style's `Pair` object before calling `compute()`, then
-restores them afterwards. This ensures the force-loop skip operates on both PACE
-sub-styles simultaneously, giving the same ~2–3× MC timer reduction measured for the
-single-PACE case.
+`hybrid` and `hybrid/scaled` pass `eflag` through to their sub-styles unchanged, so the
+`ENERGY_ONLY` bit set once in `energy_full()` reaches every sub-style on its own. The
+force-loop skip therefore operates on both PACE sub-styles simultaneously, giving the
+same ~2–3× MC timer reduction measured for the single-PACE case.
 
 ### Validation
 
@@ -271,13 +290,15 @@ _Figure 5. (Left) energy difference between the two pair styles with simulation 
 
 | File | Change |
 |---|---|
-| `src/pair.h`, `src/pair.cpp` | `energy_only` flag on `Pair` base class |
-| `src/MANYBODY/pair_eam.cpp` | Guard force loop with `if (!energy_only)` |
+| `src/force.h` | `ENERGY_ONLY = 0x04` eflag bit |
+| `src/pair.h`, `src/pair.cpp` | `eflag_only` derived in `ev_setup` / cleared in `ev_unset` |
+| `src/MANYBODY/pair_eam.cpp` | Guard force loop with `if (!eflag_only)` |
+| `src/ML-PACE/pair_grace*.cpp` | Energy-only path triggered by `eflag_only` as well as by `extract("compute_energy_only")` |
 | `src/ML-PACE/pair_pace.h` | 5 public local-energy helpers; `get_affected_local_atoms`, `accumulate_atom_energies` added for hybrid support |
 | `src/ML-PACE/pair_pace.cpp` | Implement all helpers; refactor `compute_shell_delta` to call `get_affected_local_atoms` |
 | `src/pair_hybrid_scaled.h` | `friend class FixAtomSwap` to allow reading `scaleval[]` |
 | `src/MC/fix_atom_swap.h` | `swap_count`, `noforce`, `localE` members; `pace_substyles` vector; `build_eatom_cache()` |
-| `src/MC/fix_atom_swap.cpp` | All three keywords; hybrid/scaled support; `noforce` propagated to sub-styles |
+| `src/MC/fix_atom_swap.cpp` | All three keywords; hybrid/scaled support; `noforce` sets `ENERGY_ONLY` in `energy_full()`; PACE-only localE paths behind `LMP_ATOM_SWAP_PACE` so `PKG_MC` still builds without ML-PACE |
 | `cmake/Modules/Packages/ML-PACE.cmake` | Auto-detect fork; always fetch from `thermoatoms/lammps-user-pace` |
 | `doc/src/fix_atom_swap.rst` | Full documentation for all three keywords |
 
