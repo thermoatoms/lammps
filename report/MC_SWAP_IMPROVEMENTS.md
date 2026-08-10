@@ -67,9 +67,9 @@ step recomputes them.
 
 This is deliberately the same spelling LAMMPS itself adopted after this fork was taken
 (`ENERGY_ONLY`, `Pair::eflag_only`), so code written against either tree compiles against
-both.  Styles that honor it here: `pace`, `eam`, and all `grace` variants (the GRACE
-styles also accept `extract("compute_energy_only")` as an explicit override, for callers
-that set the flag directly rather than through `eflag`).
+both.  Styles that honor it here: `pace`, `eam`, and all `grace` variants.  The eflag bit
+is the only way to request energy-only evaluation: there is no side-channel flag to set,
+so a caller cannot leave one stuck on.
 
 
 ### ACE/PACE implementation — changes to the ACE fork

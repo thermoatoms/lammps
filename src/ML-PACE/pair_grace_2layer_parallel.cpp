@@ -79,7 +79,6 @@ PairGRACE2LayerParallel::PairGRACE2LayerParallel(LAMMPS *lmp) : Pair(lmp)
   no_virial_fdotr_compute = 1;
   chunksize = 4096;
   nelements = 0;
-  flag_compute_energy_only = 0;
 }
 
 PairGRACE2LayerParallel::~PairGRACE2LayerParallel()
@@ -517,9 +516,9 @@ void PairGRACE2LayerParallel::compute(int eflag, int vflag)
 
   model2_timer.start();
   run_backward_layer_2(eflag, vflag);
-  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
-  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
-  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
+  // energy-only when the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only),
+  // e.g. an MC fix evaluating trial energies
+  bool do_energy_only = eflag_only && !debug_no_energy_only_calc;
 
   model2_timer.stop();
 
@@ -912,9 +911,9 @@ void PairGRACE2LayerParallel::run_backward_layer_2(int eflag, int vflag)
   std::vector<std::string> out_names;
   std::vector<std::string> ordered_keys;
 
-  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
-  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
-  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
+  // energy-only when the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only),
+  // e.g. an MC fix evaluating trial energies
+  bool do_energy_only = eflag_only && !debug_no_energy_only_calc;
 
   // Energy
   if (sig.outputs.count(ENERGY_KEY)) {
@@ -1137,9 +1136,6 @@ void PairGRACE2LayerParallel::print_tensors(
 
 void *PairGRACE2LayerParallel::extract(const char *str, int &dim)
 {
-  dim = 0;
-  if (strcmp(str, "compute_energy_only") == 0) return (void *) &flag_compute_energy_only;
-
   dim = 2;
   if (strcmp(str, "scale") == 0) return (void *) scale;
   return nullptr;

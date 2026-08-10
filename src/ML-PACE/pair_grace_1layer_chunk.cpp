@@ -100,7 +100,6 @@ PairGRACE1LayerChunk::PairGRACE1LayerChunk(LAMMPS *lmp) : Pair(lmp)
   tp_timer.init();
 
   no_virial_fdotr_compute = 1;
-  flag_compute_energy_only = 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -300,8 +299,6 @@ double PairGRACE1LayerChunk::init_one(int i, int j)
 
 void *PairGRACE1LayerChunk::extract(const char *str, int &dim)
 {
-  dim = 0;
-  if (strcmp(str, "compute_energy_only") == 0) return (void *) &flag_compute_energy_only;
   dim = 2;
   if (strcmp(str, "scale") == 0) return (void *) scale;
   return nullptr;
@@ -338,9 +335,9 @@ void PairGRACE1LayerChunk::compute(int eflag, int vflag)
   int *numneigh = list->numneigh;
   int **firstneigh = list->firstneigh;
 
-  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
-  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
-  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
+  // energy-only when the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only),
+  // e.g. an MC fix evaluating trial energies
+  bool do_energy_only = eflag_only && !debug_no_energy_only_calc;
   auto compute_inputs_sig = impl->compute_inputs_sig;
   if (do_energy_only) {
     if (has_compute_energy_only) {

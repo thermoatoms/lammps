@@ -71,7 +71,6 @@ PairGRACE::PairGRACE(LAMMPS *lmp) : Pair(lmp)
   data_timer.init();
 
   no_virial_fdotr_compute = 1;
-  flag_compute_energy_only = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -398,9 +397,6 @@ double PairGRACE::init_one(int i, int j)
  ---------------------------------------------------------------------- */
 void *PairGRACE::extract(const char *str, int &dim)
 {
-  dim = 0;
-  if (strcmp(str, "compute_energy_only") == 0) return (void *) &flag_compute_energy_only;
-
   dim = 2;
   if (strcmp(str, "scale") == 0) return (void *) scale;
 
@@ -514,9 +510,9 @@ void PairGRACE::compute(int eflag, int vflag)
   // the pointer to the list of neighbors of "i"
   firstneigh = list->firstneigh;
 
-  // energy-only: either the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only,
-  // e.g. an MC fix doing trial energies) or it was forced via extract("compute_energy_only")
-  bool do_energy_only = (flag_compute_energy_only || eflag_only) && !debug_no_energy_only_calc;
+  // energy-only when the caller set the ENERGY_ONLY eflag bit (Pair::eflag_only),
+  // e.g. an MC fix evaluating trial energies
+  bool do_energy_only = eflag_only && !debug_no_energy_only_calc;
 
   auto compute_inputs_sig = graceimpl->compute_inputs_sig;
   if (do_energy_only) {
