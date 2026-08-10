@@ -38,7 +38,6 @@
 #include "pair.h"
 #include "pair_hybrid.h"
 #include "pair_hybrid_scaled.h"
-#include "pair_pace.h"
 #include "input.h"
 #include "random_park.h"
 #include "region.h"
@@ -51,6 +50,23 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+
+// The localE and split-cache fast paths call pair_style pace directly (per-atom
+// energies, coordination-shell deltas), so they need the ML-PACE package.  Detect
+// whether it is installed rather than including its header unconditionally, so
+// that PKG_MC still builds standalone.  Without ML-PACE, "localE yes" degrades to
+// a no-op with a message, exactly as it does for any non-PACE pair style.
+#if !defined(LMP_ATOM_SWAP_PACE)
+#if defined(__has_include)
+#if __has_include("pair_pace.h")
+#define LMP_ATOM_SWAP_PACE 1
+#endif
+#endif
+#endif
+
+#ifdef LMP_ATOM_SWAP_PACE
+#include "pair_pace.h"
+#endif
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -608,6 +624,7 @@ void FixAtomSwap::init()
     // for non-PACE pair styles (e.g. GRACE), localE is silently ignored
     pace_substyles.clear();
     bool is_pace_style = false;
+#ifdef LMP_ATOM_SWAP_PACE
     auto *hybrid_sc = dynamic_cast<PairHybridScaled *>(force->pair);
     if (hybrid_sc) {
       bool all_pace = true;
@@ -625,12 +642,20 @@ void FixAtomSwap::init()
         is_pace_style = true;
       }
     }
+#endif
 
     if (!is_pace_style) {
-      // non-PACE pair style (e.g. GRACE): silently disable localE optimization
-      if (comm->me == 0)
-        utils::logmesg(lmp, "Fix atom/swap localE: pair style is not pace, "
-                            "localE optimization disabled (no-op)\n");
+      // non-PACE pair style (e.g. GRACE), or a build without the ML-PACE
+      // package: disable the localE optimization, energies stay exact
+      if (comm->me == 0) {
+#ifdef LMP_ATOM_SWAP_PACE
+        const char *why = "pair style is not pace";
+#else
+        const char *why = "built without the ML-PACE package";
+#endif
+        utils::logmesg(lmp, "Fix atom/swap localE: {}, localE optimization "
+                            "disabled (no-op)\n", why);
+      }
       local_energy_flag = 0;
     }
 
@@ -653,6 +678,7 @@ void FixAtomSwap::init()
     // detect type-invariant sub-style (e.g. "Au Au" endpoint in alchemical TI)
     split_cache_flag = 0;
     invariant_substyle = -1;
+#ifdef LMP_ATOM_SWAP_PACE
     if (pace_substyles.size() == 2) {
       for (int s = 0; s < 2; s++) {
         if (pace_substyles[s].first->is_type_invariant(type_list[0], type_list[1])) {
@@ -662,6 +688,7 @@ void FixAtomSwap::init()
         }
       }
     }
+#endif
     // allocate per-style unscaled cache arrays for the split-cache path
     if (split_cache_flag) {
       if (atom->nlocal > eatom_s_nmax) {
@@ -881,8 +908,12 @@ int FixAtomSwap::attempt_semi_grand()
   std::vector<std::pair<int, double>> changed_atoms;
 
   if (local_energy_flag) {
+#ifdef LMP_ATOM_SWAP_PACE
     double local_dE = pace_substyles[0].first->compute_shell_delta(
         tag_i_global, (tagint) 0, eatom_cached, changed_atoms);
+#else
+    double local_dE = 0.0;    // unreachable: localE is disabled in init() without ML-PACE
+#endif
     double total_dE;
     MPI_Allreduce(&local_dE, &total_dE, 1, MPI_DOUBLE, MPI_SUM, world);
     energy_after = energy_stored + total_dE;
@@ -1083,6 +1114,9 @@ int FixAtomSwap::attempt_swap()
 
   if (local_energy_flag) {
     double local_dE;
+#ifndef LMP_ATOM_SWAP_PACE
+    local_dE = 0.0;    // unreachable: localE is disabled in init() without ML-PACE
+#else
     if (pace_substyles.size() == 1 && pace_substyles[0].second == 1.0) {
       // fast path: single PACE, use compute_shell_delta directly
       local_dE = pace_substyles[0].first->compute_shell_delta(tag_i_global, tag_j_global,
@@ -1115,6 +1149,7 @@ int FixAtomSwap::attempt_swap()
         }
       }
     }
+#endif
     double total_dE;
     MPI_Allreduce(&local_dE, &total_dE, 1, MPI_DOUBLE, MPI_SUM, world);
     energy_after = energy_stored + total_dE;
@@ -1241,6 +1276,10 @@ double FixAtomSwap::energy_full()
 
 double FixAtomSwap::build_eatom_cache()
 {
+#ifndef LMP_ATOM_SWAP_PACE
+  // unreachable: localE, the only caller, is disabled in init() without ML-PACE
+  return 0.0;
+#else
   // grow array if nlocal has increased since last allocation
   int nlocal = atom->nlocal;
   if (nlocal > eatom_cached_nmax) {
@@ -1291,6 +1330,7 @@ double FixAtomSwap::build_eatom_cache()
   double global_sum;
   MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, world);
   return global_sum;
+#endif
 }
 
 /* ----------------------------------------------------------------------
