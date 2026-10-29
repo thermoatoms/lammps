@@ -89,6 +89,7 @@ class Error : protected Pointers {
   void set_numwarn(int val) { numwarn = val; }
   void set_maxwarn(int val) { maxwarn = val; }
   void set_allwarn(int val) { allwarn = val; }
+  void reset_warn();
 
   [[nodiscard]] std::string get_last_error() const;
   [[nodiscard]] ErrorType get_last_error_type() const;
@@ -104,7 +105,6 @@ class Error : protected Pointers {
   [[noreturn]] void _all(const std::string &, int, int, fmt::string_view, fmt::format_args args);
   [[noreturn]] void _one(const std::string &, int, int, fmt::string_view, fmt::format_args args);
   void _warning(const std::string &, int, fmt::string_view, fmt::format_args args);
-  void _message(const std::string &, int, fmt::string_view, fmt::format_args args);
 };
 
 }    // namespace LAMMPS_NS

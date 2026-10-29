@@ -34,6 +34,7 @@
 #include "image.h"
 #include "image_objects.h"
 #include "input.h"
+#include "json.h"
 #include "math_const.h"
 #include "math_extra.h"
 #include "memory.h"
@@ -52,14 +53,19 @@
 #include "region_plane.h"
 #include "region_prism.h"
 #include "region_sphere.h"
+#include "safe_pointers.h"
 #include "thermo.h"
 #include "tokenizer.h"
 #include "update.h"
 #include "variable.h"
 
+#include <algorithm>
+#include <array>
 #include <cctype>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 
 // clang-format on
 
@@ -69,11 +75,54 @@ using namespace ImageObjects;
 
 namespace {
 constexpr double BIG = 1.0e20;
-enum { NUMERIC, ATOM, TYPE, ELEMENT, ATTRIBUTE, CONSTANT, INDEX };
+constexpr int POINT_CLOUD_SEED = 19660405;
+constexpr int DEFAULT_HULL_POINTS = 100000;
+
+enum { NUMERIC, ATOM, TYPE, ELEMENT, ATTRIBUTE, CONSTANT, INDEX, LOCALVALUE };
 enum { STATIC, DYNAMIC };
 enum { NO = 0, YES = 1, AUTO = 2 };
 enum { FILLED, FRAME, POINTS, TRANSPARENT };
 enum { OFF = 0, CENTER, LOWERLEFT, LOWERRIGHT, UPPERLEFT, UPPERRIGHT };
+
+const std::vector<std::string> default_colors{
+    "darkgray",  "red",      "forestgreen", "blue",       "gold", "cyan",
+    "magenta",   "silver",   "orange",      "lime",       "gray", "darkred",
+    "darkgreen", "darkblue", "darkcyan",    "darkmagenta"};
+
+//  convenience functions to change and restore lighting, assuming uncolored light
+
+struct savedLights {
+  double ambient;
+  double key;
+  double fill;
+  double back;
+};
+
+savedLights reset_lighting(Image *image, double ambient, double key, double fill, double back)
+{
+  savedLights saved;
+  saved.ambient = image->ambientColor[0];
+  image->ambientColor[0] = image->ambientColor[1] = image->ambientColor[2] = ambient;
+  saved.key = image->keyLightColor[0];
+  image->keyLightColor[0] = image->keyLightColor[1] = image->keyLightColor[2] = key;
+  saved.fill = image->fillLightColor[0];
+  image->fillLightColor[0] = image->fillLightColor[1] = image->fillLightColor[2] = fill;
+  saved.back = image->backLightColor[0];
+  image->backLightColor[0] = image->backLightColor[1] = image->backLightColor[2] = back;
+  return saved;
+}
+
+void restore_lighting(const savedLights &saved, Image *image)
+{
+  image->ambientColor[0] = image->ambientColor[1] = image->ambientColor[2] =
+      std::clamp(saved.ambient, 0.0, 1.0);
+  image->keyLightColor[0] = image->keyLightColor[1] = image->keyLightColor[2] =
+      std::clamp(saved.key, 0.0, 1.0);
+  image->fillLightColor[0] = image->fillLightColor[1] = image->fillLightColor[2] =
+      std::clamp(saved.fill, 0.0, 1.0);
+  image->backLightColor[0] = image->backLightColor[1] = image->backLightColor[2] =
+      std::clamp(saved.back, 0.0, 1.0);
+}
 
 }    // namespace
 // clang-format off
@@ -81,7 +130,8 @@ enum { OFF = 0, CENTER, LOWERLEFT, LOWERRIGHT, UPPERLEFT, UPPERRIGHT };
 /* ---------------------------------------------------------------------- */
 
 DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
-    DumpCustom(lmp, narg, arg), thetastr(nullptr), phistr(nullptr), cxstr(nullptr), cystr(nullptr),
+    DumpCustom(lmp, narg, arg), id_bond_compute(nullptr), bond_compute(nullptr),
+    thetastr(nullptr), phistr(nullptr), cxstr(nullptr), cystr(nullptr),
     czstr(nullptr), upxstr(nullptr), upystr(nullptr), upzstr(nullptr), zoomstr(nullptr),
     diamtype(nullptr), diamelement(nullptr), bdiamtype(nullptr), colortype(nullptr),
     colorelement(nullptr), bcolortype(nullptr), aopacity(nullptr), bopacity(nullptr),
@@ -146,10 +196,10 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
   if (strcmp(arg[6],"type") == 0) adiam = TYPE;
   else if (strcmp(arg[6],"element") == 0) adiam = ELEMENT;
 
-  // create Image class with two colormaps for atoms and grid cells
+  // create Image class with three colormaps for atoms, grid cells, and bonds
   // change defaults for 2d
 
-  image = new Image(lmp,2);
+  image = new Image(lmp,3);
 
   if (domain->dimension == 2) {
     image->theta = 0.0;
@@ -161,11 +211,13 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
 
   atomflag = YES;
   gridflag = NO;
+  grid_opacity = 1.0;
   lineflag = triflag = bodyflag = ellipsoidflag = NO;
 
   bcolor = ATOM;
   bdiam = NUMERIC;
   bdiamvalue = 0.5;
+  bond_argindex = 0;
   if (atom->nbondtypes == 0) {
     bondflag = NO;
   } else {
@@ -221,7 +273,17 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       if (strcmp(arg[iarg+1],"none") == 0) bondflag = NO;
       else if (strcmp(arg[iarg+1],"atom") == 0) bcolor = ATOM;
       else if (strcmp(arg[iarg+1],"type") == 0) bcolor = TYPE;
-      else error->all(FLERR, iarg + 1, "Unknown dump image bond color setting {}", arg[iarg + 1]);
+      else if (utils::strmatch(arg[iarg+1],"^c_")) {
+        // color each bond by a per-bond value from a /local compute, mapped via bmap
+        ArgInfo argi(arg[iarg+1], ArgInfo::COMPUTE);
+        if ((argi.get_type() != ArgInfo::COMPUTE) || (argi.get_dim() > 1))
+          error->all(FLERR, iarg+1, "Invalid dump image bond color compute reference {}",
+                     arg[iarg+1]);
+        bcolor = LOCALVALUE;
+        delete[] id_bond_compute;
+        id_bond_compute = argi.copy_name();
+        bond_argindex = argi.get_index1();
+      } else error->all(FLERR, iarg + 1, "Unknown dump image bond color setting {}", arg[iarg + 1]);
       if (!islower(arg[iarg+2][0])) {
           bdiam = NUMERIC;
           bdiamvalue = utils::numeric(FLERR,arg[iarg+2],false,lmp);
@@ -261,7 +323,10 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+3 > narg) utils::missing_cmd_args(FLERR,"dump image line", error);
       lineflag = YES;
       if (strcmp(arg[iarg+1],"type") == 0) lcolor = TYPE;
-      else error->all(FLERR, iarg+1, "Dump image line only supports color by type");
+      else if (strcmp(arg[iarg+1],"atom") == 0) lcolor = ATOM;
+      else if (strcmp(arg[iarg+1],"index") == 0) lcolor = INDEX;
+      else
+        error->all(FLERR, iarg+1, "Dump image line only supports color by type, atom, or index");
       ldiam = NUMERIC;
       ldiamvalue = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       iarg += 3;
@@ -270,7 +335,10 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+4 > narg) utils::missing_cmd_args(FLERR,"dump image tri", error);
       triflag = YES;
       if (strcmp(arg[iarg+1],"type") == 0) tcolor = TYPE;
-      else error->all(FLERR, iarg+1, "Dump image tri only supports color by type");
+      else if (strcmp(arg[iarg+1],"atom") == 0) tcolor = ATOM;
+      else if (strcmp(arg[iarg+1],"index") == 0) tcolor = INDEX;
+      else
+        error->all(FLERR, iarg+1, "Dump image tri only supports color by type, atom, or index");
       tstyle = utils::inumeric(FLERR,arg[iarg+2],false,lmp);
       tdiamvalue = utils::numeric(FLERR,arg[iarg+3],false,lmp);
       iarg += 4;
@@ -279,14 +347,18 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+5 > narg) utils::missing_cmd_args(FLERR,"dump image ellipsoid", error);
       ellipsoidflag = YES;
       if (strcmp(arg[iarg+1],"type") == 0) ecolor = TYPE;
-      else error->all(FLERR, iarg+1, "Dump image ellipsoid only supports color by type");
+      else if (strcmp(arg[iarg+1],"atom") == 0) ecolor = ATOM;
+      else if (strcmp(arg[iarg+1],"index") == 0) ecolor = INDEX;
+      else
+        error->all(FLERR, iarg+1, "Dump image ellipsoid only supports color by type, atom, or index");
       estyle = utils::inumeric(FLERR,arg[iarg+2],false,lmp);
-      if ((estyle < 0) || (estyle > 3))
-        error->all(FLERR, iarg+2, "Dump image ellipsoid only supports style setting 1, 2, or 3");
+      // unless the wireframe setting is requested, we draw rounded triangles
+      if (estyle !=2) estyle = 1;
+
       elevel = utils::inumeric(FLERR,arg[iarg+3],false,lmp);
       if (elevel == 0) elevel = 4; // default setting
-      if (elevel > 6)
-        error->all(FLERR, iarg+3, "Dump image ellipsoid mesh refinement level is too large");
+      if ((elevel < 0) || (elevel > 6))
+        error->all(FLERR, iarg+3, "Dump image ellipsoid invalid mesh refinement level {}", elevel);
       ediamvalue = utils::numeric(FLERR,arg[iarg+4],false,lmp);
       iarg += 5;
 
@@ -294,11 +366,10 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       if (iarg+4 > narg) utils::missing_cmd_args(FLERR,"dump image body", error);
       bodyflag = YES;
       if (strcmp(arg[iarg+1],"type") == 0) bodycolor = TYPE;
+      else if (strcmp(arg[iarg+1],"atom") == 0) bodycolor = ATOM;
       else if (strcmp(arg[iarg+1],"index") == 0) bodycolor = INDEX;
       else
-        error->all(FLERR, iarg+1, "Dump image body only supports color by type or index");
-      if (acolor != TYPE)
-        error->all(FLERR, iarg+1, "Must color atoms by type with body particles");
+        error->all(FLERR, iarg+1, "Dump image body only supports color by type, atom, or index");
       bodyflag1 = utils::numeric(FLERR,arg[iarg+2],false,lmp);
       bodyflag2 = utils::numeric(FLERR,arg[iarg+3],false,lmp);
       iarg += 4;
@@ -372,10 +443,17 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
         opacity = utils::numeric(FLERR, arg[iarg+4], false, lmp);
         if ((opacity < 0.0) || (opacity > 1.0))
           error->all(FLERR, iarg+4, "Dump image region opacity must be in the range 0.0 to 1.0");
-
         ++iarg;
       }
       iarg += 4;
+
+      // the points keyword may be added for any draw style in case we use a convex hull
+      if ((iarg+1 < narg) && (strcmp(arg[iarg],"hull_points") == 0)) {
+        npoints = utils::inumeric(FLERR, arg[iarg+1], false, lmp);
+        if (npoints < 1)
+          error->all(FLERR, iarg, "Dump image region number of points must be > 0");
+        iarg += 2;
+      }
       regions.emplace_back(regptr->id, regptr, regcolor, drawstyle, framediam, opacity, npoints);
 
     } else if (strcmp(arg[iarg],"size") == 0) {
@@ -544,6 +622,55 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
       image->ssaoint = ssaoint;
       iarg += 4;
 
+    } else if (strcmp(arg[iarg],"depthcue") == 0) {
+      if (iarg+5 > narg) utils::missing_cmd_args(FLERR,"dump image depthcue", error);
+      image->depthcue = utils::logical(FLERR,arg[iarg+1],false,lmp);
+      double cfactor = utils::numeric(FLERR,arg[iarg+2],false,lmp);
+      if (cfactor < 0.0 || cfactor > 1.0)
+        error->all(FLERR, iarg+2, "Invalid dump image depthcue strength value {}", cfactor);
+      image->depthcueint = cfactor;
+      if (strcmp(arg[iarg+3],"auto") == 0) {
+        image->depthcuecolor = nullptr;
+      } else {
+        image->depthcuecolor = image->color2rgb(arg[iarg+3]);
+        if (image->depthcuecolor == nullptr)
+          error->all(FLERR, iarg+3, "Invalid dump image depthcue color {}", arg[iarg+3]);
+      }
+      if (strcmp(arg[iarg+4],"auto") == 0) {
+        image->depthcuestartflag = 0;
+      } else {
+        image->depthcuestart = utils::numeric(FLERR,arg[iarg+4],false,lmp);
+        image->depthcuestartflag = 1;
+      }
+      iarg += 5;
+
+    } else if (strcmp(arg[iarg],"defocus") == 0) {
+      if (iarg+4 > narg) utils::missing_cmd_args(FLERR,"dump image defocus", error);
+      image->defocus = utils::logical(FLERR,arg[iarg+1],false,lmp);
+      double bfactor = utils::numeric(FLERR,arg[iarg+2],false,lmp);
+      if (bfactor < 0.0 || bfactor > 1.0)
+        error->all(FLERR, iarg+2, "Invalid dump image defocus strength value {}", bfactor);
+      image->defocusint = bfactor;
+      if (strcmp(arg[iarg+3],"auto") == 0) {
+        image->defocusstartflag = 0;
+      } else {
+        image->defocusstart = utils::numeric(FLERR,arg[iarg+3],false,lmp);
+        image->defocusstartflag = 1;
+      }
+      iarg += 4;
+
+    } else if (strcmp(arg[iarg],"outline") == 0) {
+      if (iarg+4 > narg) utils::missing_cmd_args(FLERR,"dump image outline", error);
+      image->outline = utils::logical(FLERR,arg[iarg+1],false,lmp);
+      int owidth = utils::inumeric(FLERR,arg[iarg+2],false,lmp);
+      if (owidth < 1 || owidth > 16)
+        error->all(FLERR, iarg+2, "Invalid dump image outline width {}", owidth);
+      image->outlinewidth = owidth;
+      image->outlinecolor = image->color2rgb(arg[iarg+3]);
+      if (image->outlinecolor == nullptr)
+        error->all(FLERR, iarg+3, "Invalid dump image outline color {}", arg[iarg+3]);
+      iarg += 4;
+
     } else error->all(FLERR, iarg, "Unknown dump image keyword {}", arg[iarg]);
   }
 
@@ -593,15 +720,11 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
   colorelement = new double*[ntypes+1];
   aopacity = new double[ntypes+1];
 
+  const int num_default_colors = default_colors.size();
   for (int i = 1; i <= ntypes; i++) {
     diamtype[i] = 1.0;
     aopacity[i] = 1.0;
-    if (i % 6 == 1) colortype[i] = image->color2rgb("red");
-    else if (i % 6 == 2) colortype[i] = image->color2rgb("green");
-    else if (i % 6 == 3) colortype[i] = image->color2rgb("blue");
-    else if (i % 6 == 4) colortype[i] = image->color2rgb("yellow");
-    else if (i % 6 == 5) colortype[i] = image->color2rgb("cyan");
-    else if (i % 6 == 0) colortype[i] = image->color2rgb("magenta");
+    colortype[i] = image->color2rgb(default_colors[i % num_default_colors]);
   }
 
   if (bondflag == YES) {
@@ -611,12 +734,7 @@ DumpImage::DumpImage(LAMMPS *lmp, int narg, char **arg) :
     for (int i = 1; i <= atom->nbondtypes; i++) {
       bdiamtype[i] = 0.5;
       bopacity[i] = 1.0;
-      if (i % 6 == 1) bcolortype[i] = image->color2rgb("red");
-      else if (i % 6 == 2) bcolortype[i] = image->color2rgb("green");
-      else if (i % 6 == 3) bcolortype[i] = image->color2rgb("blue");
-      else if (i % 6 == 4) bcolortype[i] = image->color2rgb("yellow");
-      else if (i % 6 == 5) bcolortype[i] = image->color2rgb("cyan");
-      else if (i % 6 == 0) bcolortype[i] = image->color2rgb("magenta");
+      bcolortype[i] = image->color2rgb(default_colors[i % num_default_colors]);
     }
   }
 
@@ -667,6 +785,7 @@ DumpImage::~DumpImage()
 
   delete[] id_grid_compute;
   delete[] id_grid_fix;
+  delete[] id_bond_compute;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -817,6 +936,31 @@ void DumpImage::init_style()
                    style, fixptr->style, utils::errorurl(7));
     }
   }
+
+  // resolve and validate the per-bond /local compute used to color bonds
+
+  if ((bondflag == YES) && (bcolor == LOCALVALUE)) {
+    bond_compute = modify->get_compute_by_id(id_bond_compute);
+    if (!bond_compute)
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Could not find dump image bond compute ID {}", id_bond_compute);
+    if (bond_compute->local_flag == 0)
+      error->all(FLERR, Error::NOLASTLINE,
+                 "Dump image bond compute {} does not compute local info", id_bond_compute);
+    if (bond_argindex == 0) {
+      if (bond_compute->size_local_cols != 0)
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Dump image bond compute {} does not compute a local vector", id_bond_compute);
+    } else {
+      if (bond_compute->size_local_cols == 0)
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Dump image bond compute {} does not compute a local array", id_bond_compute);
+      if (bond_argindex > bond_compute->size_local_cols)
+        error->all(FLERR, Error::NOLASTLINE,
+                   "Dump image bond compute {} local array has no column {}",
+                   id_bond_compute, bond_argindex);
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -849,7 +993,7 @@ void DumpImage::write()
 
   // set minmax color range if using dynamic atom color map
 
-  if (acolor == ATTRIBUTE && image->map_dynamic(0)) {
+  if (acolor == ATTRIBUTE && image->map_dynamic(Image::ATOM_MAP)) {
     double two[2],twoall[2];
     double lo = BIG;
     double hi = -BIG;
@@ -862,7 +1006,7 @@ void DumpImage::write()
     two[0] = -lo;
     two[1] = hi;
     MPI_Allreduce(two,twoall,2,MPI_DOUBLE,MPI_MAX,world);
-    int flag = image->map_minmax(0,-twoall[0],twoall[1]);
+    int flag = image->map_minmax(Image::ATOM_MAP,-twoall[0],twoall[1]);
     if (flag) error->all(FLERR,"Invalid atom color map min/max values");
   }
 
@@ -974,7 +1118,7 @@ void DumpImage::write()
 
   // set minmax color range if using dynamic grid color map
 
-  if (gridflag && image->map_dynamic(1)) {
+  if (gridflag && image->map_dynamic(Image::GRID_MAP)) {
     double two[2],twoall[2];
     double lo = BIG;
     double hi = -BIG;
@@ -985,8 +1129,41 @@ void DumpImage::write()
     two[0] = -lo;
     two[1] = hi;
     MPI_Allreduce(two,twoall,2,MPI_DOUBLE,MPI_MAX,world);
-    int flag = image->map_minmax(1,-twoall[0],twoall[1]);
+    int flag = image->map_minmax(Image::GRID_MAP,-twoall[0],twoall[1]);
     if (flag) error->all(FLERR,"Invalid grid color map min/max values");
+  }
+
+  // invoke per-bond compute and (if dynamic) set the bond color map range
+  // the per-bond values are local to each proc, so no communication is needed
+
+  if ((bondflag == YES) && (bcolor == LOCALVALUE)) {
+    if (!bond_compute->is_initialized())
+      error->all(FLERR, "Bond compute ID {} used in dump image cannot be invoked "
+                 "before initialization by a run", bond_compute->id);
+    if (!(bond_compute->invoked_flag & Compute::INVOKED_LOCAL)) {
+      bond_compute->compute_local();
+      bond_compute->invoked_flag |= Compute::INVOKED_LOCAL;
+    }
+
+    if (image->map_dynamic(Image::BOND_MAP)) {
+      double *vec = bond_compute->vector_local;
+      double **arr = bond_compute->array_local;
+      int nrows = bond_compute->size_local_rows;
+      int col = bond_argindex - 1;
+      double two[2],twoall[2];
+      double lo = BIG;
+      double hi = -BIG;
+      for (int i = 0; i < nrows; i++) {
+        double val = (bond_argindex == 0) ? vec[i] : arr[i][col];
+        lo = MIN(lo,val);
+        hi = MAX(hi,val);
+      }
+      two[0] = -lo;
+      two[1] = hi;
+      MPI_Allreduce(two,twoall,2,MPI_DOUBLE,MPI_MAX,world);
+      int flag = image->map_minmax(Image::BOND_MAP,-twoall[0],twoall[1]);
+      if (flag) error->all(FLERR,"Invalid bond color map min/max values");
+    }
   }
 
   // create image on each proc, then merge them
@@ -1003,8 +1180,7 @@ void DumpImage::write()
     else if (filetype == TGA) image->write_TGA(fp);
     else image->write_PPM(fp);
     if (multifile) {
-      fclose(fp);
-      fp = nullptr;
+      fp = nullptr;             // implicitly close file
 
       // cache last dump image filename for access through library interface.
       // update only *after* the file has been written so there will be no invalid read.
@@ -1103,7 +1279,7 @@ void DumpImage::create_image()
 {
   int i,j,k,m,n,itype,atom1,atom2,imol,iatom,btype,ibonus,drawflag;
   tagint tagprev;
-  double diameter,delx,dely,delz;
+  double diameter,opacity,delx,dely,delz;
   int *bodyvec;
   double **bodyarray;
   double *color,*color1,*color2;
@@ -1111,10 +1287,15 @@ void DumpImage::create_image()
   double pt1[3],pt2[3],pt3[3];
   double mat[3][3];
 
+  // set defaults to avoid accidental uninitialized accesses
+  diameter = 1.0;
+  opacity = 1.0;
+
   // render my atoms
 
   if (atomflag) {
     double **x = atom->x;
+    int *type = atom->type;
     int *line = atom->line;
     int *tri = atom->tri;
     int *ellipsoid = atom->ellipsoid;
@@ -1124,23 +1305,21 @@ void DumpImage::create_image()
     for (i = 0; i < nchoose; i++) {
       j = clist[i];
 
+      itype = type[j];
+      opacity = aopacity[itype];
       if (acolor == TYPE) {
-        itype = static_cast<int>(buf[m]);
         color = colortype[itype];
       } else if (acolor == ELEMENT) {
-        itype = static_cast<int>(buf[m]);
         color = colorelement[itype];
       } else if (acolor == ATTRIBUTE) {
-        color = image->map_value2color(0,buf[m]);
+        color = image->map_value2color(Image::ATOM_MAP,buf[m]);
       } else color = image->color2rgb("white");
 
       if (adiam == NUMERIC) {
         diameter = adiamvalue;
       } else if (adiam == TYPE) {
-        itype = static_cast<int>(buf[m+1]);
         diameter = diamtype[itype];
       } else if (adiam == ELEMENT) {
-        itype = static_cast<int>(buf[m+1]);
         diameter = diamelement[itype];
       } else if (adiam == ATTRIBUTE) {
         diameter = buf[m+1];
@@ -1156,7 +1335,7 @@ void DumpImage::create_image()
         if (bodyflag && body[j] >= 0) drawflag = 0;
       }
 
-      if (drawflag) image->draw_sphere(x[j],color,diameter,aopacity[atom->type[j]]);
+      if (drawflag) image->draw_sphere(x[j],color,diameter,opacity);
 
       m += size_one;
     }
@@ -1171,53 +1350,47 @@ void DumpImage::create_image()
 
     // reset lighting for flat surfaces to make them brighter
 
-    image->ambientColor[0] = image->ambientColor[1] = image->ambientColor[2] = 0.9;
-    image->keyLightColor[0] = image->keyLightColor[1] = image->keyLightColor[2] = 0.3;
-    image->fillLightColor[0] = image->fillLightColor[1] = image->fillLightColor[2] = 0.3;
-    image->backLightColor[0] = image->backLightColor[1] = image->backLightColor[2] = 0.3;
+    auto saved = reset_lighting(image, 0.9, 0.3, 0.3, 0.3);
 
     int n = 0;
     if (domain->dimension == 2) {
       for (int iy = nylo_in; iy <= nyhi_in; iy++)
         for (int ix = nxlo_in; ix <= nxhi_in; ix++) {
           grid_cell_corners_2d(ix,iy);
-          color = image->map_value2color(1,gbuf[n++]);
-          image->draw_triangle(gcorners[0],gcorners[1],gcorners[3],color);
-          image->draw_triangle(gcorners[0],gcorners[3],gcorners[2],color);
+          color = image->map_value2color(Image::GRID_MAP,gbuf[n++]);
+          image->draw_triangle(gcorners[0],gcorners[1],gcorners[3],color,grid_opacity);
+          image->draw_triangle(gcorners[0],gcorners[3],gcorners[2],color,grid_opacity);
         }
     } else {
       for (int iz = nzlo_in; iz <= nzhi_in; iz++)
         for (int iy = nylo_in; iy <= nyhi_in; iy++)
           for (int ix = nxlo_in; ix <= nxhi_in; ix++) {
             grid_cell_corners_3d(ix,iy,iz);
-            color = image->map_value2color(1,gbuf[n++]);
+            color = image->map_value2color(Image::GRID_MAP,gbuf[n++]);
             // lower x face
-            image->draw_triangle(gcorners[0],gcorners[4],gcorners[6],color);
-            image->draw_triangle(gcorners[0],gcorners[6],gcorners[2],color);
+            image->draw_triangle(gcorners[0],gcorners[4],gcorners[6],color,grid_opacity);
+            image->draw_triangle(gcorners[0],gcorners[6],gcorners[2],color,grid_opacity);
             // upper x face
-            image->draw_triangle(gcorners[1],gcorners[5],gcorners[7],color);
-            image->draw_triangle(gcorners[1],gcorners[7],gcorners[3],color);
+            image->draw_triangle(gcorners[1],gcorners[5],gcorners[7],color,grid_opacity);
+            image->draw_triangle(gcorners[1],gcorners[7],gcorners[3],color,grid_opacity);
             // lower y face
-            image->draw_triangle(gcorners[0],gcorners[1],gcorners[5],color);
-            image->draw_triangle(gcorners[0],gcorners[5],gcorners[4],color);
+            image->draw_triangle(gcorners[0],gcorners[1],gcorners[5],color,grid_opacity);
+            image->draw_triangle(gcorners[0],gcorners[5],gcorners[4],color,grid_opacity);
             // upper y face
-            image->draw_triangle(gcorners[2],gcorners[6],gcorners[7],color);
-            image->draw_triangle(gcorners[2],gcorners[7],gcorners[3],color);
+            image->draw_triangle(gcorners[2],gcorners[6],gcorners[7],color,grid_opacity);
+            image->draw_triangle(gcorners[2],gcorners[7],gcorners[3],color,grid_opacity);
             // lower z face
-            image->draw_triangle(gcorners[0],gcorners[2],gcorners[3],color);
-            image->draw_triangle(gcorners[0],gcorners[3],gcorners[1],color);
+            image->draw_triangle(gcorners[0],gcorners[2],gcorners[3],color,grid_opacity);
+            image->draw_triangle(gcorners[0],gcorners[3],gcorners[1],color,grid_opacity);
             // upper z face
-            image->draw_triangle(gcorners[4],gcorners[5],gcorners[7],color);
-            image->draw_triangle(gcorners[4],gcorners[7],gcorners[6],color);
+            image->draw_triangle(gcorners[4],gcorners[5],gcorners[7],color,grid_opacity);
+            image->draw_triangle(gcorners[4],gcorners[7],gcorners[6],color,grid_opacity);
           }
     }
 
     // restore lighting for curved objects
 
-    image->ambientColor[0] = image->ambientColor[1] = image->ambientColor[2] = 0.0;
-    image->keyLightColor[0] = image->keyLightColor[1] = image->keyLightColor[2] = 0.9;
-    image->fillLightColor[0] = image->fillLightColor[1] = image->fillLightColor[2] = 0.45;
-    image->backLightColor[0] = image->backLightColor[1] = image->backLightColor[2] = 0.9;
+    restore_lighting(saved, image);
   }
 
   // render atoms that are lines
@@ -1228,12 +1401,30 @@ void DumpImage::create_image()
     int *line = atom->line;
     int *type = atom->type;
 
+    m = 0;
     for (i = 0; i < nchoose; i++) {
       j = clist[i];
       if (line[j] < 0) continue;
 
+      itype = type[j];
+      opacity = aopacity[itype];
       if (lcolor == TYPE) {
-        color = colortype[type[j]];
+        color = colortype[itype];
+      } else if (lcolor == INDEX) {
+        itype = (line[j] % atom->ntypes) + 1;
+        color = colortype[itype];
+      } else if (lcolor == ATOM) {
+        if (acolor == TYPE) {
+          color = colortype[itype];
+        } else if (acolor == ELEMENT) {
+          color = colorelement[itype];
+        } else if (acolor == ATTRIBUTE) {
+          color = image->map_value2color(Image::ATOM_MAP,buf[m]);
+        } else {
+          color = image->color2rgb("white");
+        }
+      } else {
+        color = image->color2rgb("white");
       }
 
       if (ldiam == NUMERIC) {
@@ -1252,7 +1443,9 @@ void DumpImage::create_image()
       pt2[1] = x[j][1] - dy;
       pt2[2] = 0.0;
 
-      image->draw_cylinder(pt1,pt2,color,ldiamvalue,3,aopacity[atom->type[j]]);
+      image->draw_cylinder(pt1,pt2,color,ldiamvalue,3,opacity);
+
+      m += size_one;
     }
   }
 
@@ -1269,14 +1462,31 @@ void DumpImage::create_image()
     int *tri = atom->tri;
     int *type = atom->type;
 
+    m = 0;
     for (i = 0; i < nchoose; i++) {
       j = clist[i];
       if (tri[j] < 0) continue;
 
+      itype = type[j];
+      opacity = aopacity[itype];
       if (tcolor == TYPE) {
-        color = colortype[type[j]];
+        color = colortype[itype];
+      } else if (tcolor == INDEX) {
+        itype = (tri[j] % atom->ntypes) + 1;
+        color = colortype[itype];
+      } else if (tcolor == ATOM) {
+        if (acolor == TYPE) {
+          color = colortype[itype];
+        } else if (acolor == ELEMENT) {
+          color = colorelement[itype];
+        } else if (acolor == ATTRIBUTE) {
+          color = image->map_value2color(Image::ATOM_MAP,buf[m]);
+        } else {
+          color = image->color2rgb("white");
+        }
+      } else {
+        color = image->color2rgb("white");
       }
-      double opacity = aopacity[atom->type[j]];
 
       MathExtra::quat_to_mat(avec_tri->bonus[tri[j]].quat,mat);
       MathExtra::matvec(mat,avec_tri->bonus[tri[j]].c1,pt1);
@@ -1286,32 +1496,68 @@ void DumpImage::create_image()
       MathExtra::add3(pt2,x[j],pt2);
       MathExtra::add3(pt3,x[j],pt3);
 
-      if (tridraw) image->draw_triangle(pt1,pt2,pt3,color,opacity);
+      if (tridraw) {
+        // brighten flat surfaces a bit
+        auto saved = reset_lighting(image, 0.3, 0.8, 0.45, 0.8);
+
+        image->draw_triangle(pt1,pt2,pt3,color,opacity);
+
+        // restore previous settings
+        restore_lighting(saved, image);
+      }
       if (edgedraw) {
         image->draw_cylinder(pt1,pt2,color,tdiamvalue,3,opacity);
         image->draw_cylinder(pt2,pt3,color,tdiamvalue,3,opacity);
         image->draw_cylinder(pt3,pt1,color,tdiamvalue,3,opacity);
       }
+      m += size_one;
     }
   }
 
   // render atoms that are ellipsoids
-  // estyle = 1 for tri only, estyle 2 for wireframe only, estyle 3 for both
+  // estyle = 1 for tri only, estyle 2 for wireframe only
 
   if (ellipsoidflag) {
     double **x = atom->x;
     int *ellipsoid = atom->ellipsoid;
     int *type = atom->type;
+    m = 0;
+
     for (i = 0; i < nchoose; i++) {
       j = clist[i];
       if (ellipsoid[j] < 0) continue;
 
+      itype = type[j];
+      opacity = aopacity[itype];
       if (ecolor == TYPE) {
-        color = colortype[type[j]];
+        color = colortype[itype];
+      } else if (ecolor == INDEX) {
+        itype = (ellipsoid[j] % atom->ntypes) + 1;
+        color = colortype[itype];
+      } else if (ecolor == ATOM) {
+        if (acolor == TYPE) {
+          color = colortype[itype];
+        } else if (acolor == ELEMENT) {
+          color = colorelement[itype];
+        } else if (acolor == ATTRIBUTE) {
+          color = image->map_value2color(Image::ATOM_MAP,buf[m]);
+        } else {
+          color = image->color2rgb("white");
+        }
+      } else {
+        color = image->color2rgb("white");
       }
       EllipsoidObj e(elevel);
-      e.draw(image, estyle, color, x[j], avec_ellipsoid->bonus[ellipsoid[j]].shape,
-             avec_ellipsoid->bonus[ellipsoid[j]].quat, ediamvalue, aopacity[type[j]]);
+      if (avec_ellipsoid->bonus_super) {
+        auto *bonus = avec_ellipsoid->bonus_super;
+        e.draw(image, estyle, color, x[j], bonus[ellipsoid[j]].shape, bonus[ellipsoid[j]].quat,
+               ediamvalue, opacity, bonus[ellipsoid[j]].block);
+      } else {
+        auto *bonus = avec_ellipsoid->bonus;
+        e.draw(image, estyle, color, x[j], bonus[ellipsoid[j]].shape,bonus[ellipsoid[j]].quat,
+               ediamvalue, opacity, nullptr);
+      }
+      m += size_one;
     }
   }
 
@@ -1320,22 +1566,33 @@ void DumpImage::create_image()
   if (bodyflag) {
     Body *bptr = avec_body->bptr;
     int *body = atom->body;
+    int *type = atom->type;
 
     m = 0;
     for (i = 0; i < nchoose; i++) {
       j = clist[i];
       if (body[j] < 0) continue;
 
+      itype = type[j];
+      opacity = aopacity[itype];
       if (bodycolor == TYPE) {
-        itype = static_cast<int>(buf[m]);
         color = colortype[itype];
       } else if (bodycolor == INDEX) {
         itype = (body[j] % atom->ntypes) + 1;
         color = colortype[itype];
+      } else if (bodycolor == ATOM) {
+        if (acolor == TYPE) {
+          color = colortype[itype];
+        } else if (acolor == ELEMENT) {
+          color = colorelement[itype];
+        } else if (acolor == ATTRIBUTE) {
+          color = image->map_value2color(Image::ATOM_MAP,buf[m]);
+        } else {
+          color = image->color2rgb("white");
+        }
       } else {
         color = image->color2rgb("white");
       }
-      double opacity = aopacity[atom->type[j]];
 
       ibonus = body[j];
       n = bptr->image(ibonus,bodyflag1,bodyflag2,bodyvec,bodyarray);
@@ -1344,8 +1601,13 @@ void DumpImage::create_image()
           image->draw_sphere(bodyarray[k],color,bodyarray[k][3],opacity);
         else if (bodyvec[k] == Graphics::LINE)
           image->draw_cylinder(&bodyarray[k][0],&bodyarray[k][3],color,bodyarray[k][6],3,opacity);
-        else if (bodyvec[k] == Graphics::TRI)
+        else if (bodyvec[k] == Graphics::TRI) {
           image->draw_triangle(&bodyarray[k][0],&bodyarray[k][3],&bodyarray[k][6],color,opacity);
+        } else if (bodyvec[k] == Graphics::TRINORM) {
+          image->draw_trinorm(&bodyarray[k][0],&bodyarray[k][3],&bodyarray[k][6],
+                              &bodyarray[k][9],&bodyarray[k][12],&bodyarray[k][15],
+                              color,color,color,opacity);
+        }
       }
 
       m += size_one;
@@ -1401,6 +1663,23 @@ void DumpImage::create_image()
 
     comm->forward_comm(this);
 
+    // per-bond coloring from a /local compute: set up data pointers and a row
+    // counter that advances in lockstep with the compute's bond iteration.
+    // both loop over local atoms then bond slots with identical skip rules, so
+    // the n-th rendered bond is the n-th compute row when the compute's group
+    // selects the same bonds as the dump (checked after the loop)
+
+    double *bond_localvec = nullptr;
+    double **bond_localarr = nullptr;
+    int bond_localrows = 0;
+    int bond_localcol = bond_argindex - 1;
+    int ibond = 0;
+    if (bcolor == LOCALVALUE) {
+      bond_localvec = bond_compute->vector_local;
+      bond_localarr = bond_compute->array_local;
+      bond_localrows = bond_compute->size_local_rows;
+    }
+
     for (i = 0; i < nchoose; i++) {
       atom1 = clist[i];
       if (molecular == Atom::MOLECULAR) n = num_bond[atom1];
@@ -1424,6 +1703,7 @@ void DumpImage::create_image()
         if (atom2 < 0 || !chooseghost[atom2]) continue;
         if (newton_bond == 0 && tag[atom1] > tag[atom2]) continue;
         if (btype == 0) continue;
+        if (btype < 0) btype = -btype;
 
         if (bcolor == ATOM) {
           if (acolor == TYPE) {
@@ -1433,16 +1713,21 @@ void DumpImage::create_image()
             color1 = colorelement[type[atom1]];
             color2 = colorelement[type[atom2]];
           } else if (acolor == ATTRIBUTE) {
-            color1 = image->map_value2color(0,bufcopy[atom1][0]);
-            color2 = image->map_value2color(0,bufcopy[atom2][0]);
+            color1 = image->map_value2color(Image::ATOM_MAP,bufcopy[atom1][0]);
+            color2 = image->map_value2color(Image::ATOM_MAP,bufcopy[atom2][0]);
           } else {
             color1 = image->color2rgb("white");
             color2 = image->color2rgb("white");
           }
         } else if (bcolor == TYPE) {
-          itype = btype;
-          if (itype < 0) itype = -itype;
-          color = bcolortype[itype];
+          color = bcolortype[btype];
+        } else if (bcolor == LOCALVALUE) {
+          if (ibond >= bond_localrows)
+            error->one(FLERR, "Dump image bond compute {} produced fewer values than rendered "
+                       "bonds; its group must select the same bonds as the dump", id_bond_compute);
+          double val = (bond_argindex == 0) ? bond_localvec[ibond] : bond_localarr[ibond][bond_localcol];
+          ++ibond;
+          color = image->map_value2color(Image::BOND_MAP,val);
         }
 
         if (bdiam == NUMERIC) {
@@ -1458,9 +1743,7 @@ void DumpImage::create_image()
             diameter = MIN(bufcopy[atom1][1],bufcopy[atom2][1]);
           }
         } else if (bdiam == TYPE) {
-          itype = btype;
-          if (itype < 0) itype = -itype;
-          diameter = bdiamtype[itype];
+          diameter = bdiamtype[btype];
         }
 
         // draw cylinder in 2 pieces if bcolor = ATOM
@@ -1483,12 +1766,20 @@ void DumpImage::create_image()
           xmid[1] = x[atom2][1] - 0.5*dely;
           xmid[2] = x[atom2][2] - 0.5*delz;
           if (bcolor == ATOM)
-            image->draw_cylinder(xmid,x[atom2],color2,diameter,3,aopacity[type[atom1]]);
+            image->draw_cylinder(xmid,x[atom2],color2,diameter,3,aopacity[type[atom2]]);
           else image->draw_cylinder(xmid,x[atom2],color,diameter,3,bopacity[btype]);
 
         } else image->draw_cylinder(x[atom1],x[atom2],color,diameter,3,bopacity[btype]);
       }
     }
+
+    // the per-bond compute must yield exactly one value per rendered bond, in the
+    // same order; a count mismatch means its group did not select the same bonds
+
+    if ((bcolor == LOCALVALUE) && (ibond != bond_localrows))
+      error->one(FLERR, "Dump image bond compute {} produced {} values but {} bonds were "
+                 "rendered; its group must select the same bonds as the dump",
+                 id_bond_compute, bond_localrows, ibond);
   }
 
   // render dynamic bonds for my atoms
@@ -1583,8 +1874,8 @@ void DumpImage::create_image()
               color1 = colorelement[type[atom1]];
               color2 = colorelement[type[atom2]];
             } else if (acolor == ATTRIBUTE) {
-              color1 = image->map_value2color(0,bufcopy[atom1][0]);
-              color2 = image->map_value2color(0,bufcopy[atom2][0]);
+              color1 = image->map_value2color(Image::ATOM_MAP,bufcopy[atom1][0]);
+              color2 = image->map_value2color(Image::ATOM_MAP,bufcopy[atom2][0]);
             } else {
               color1 = image->color2rgb("white");
               color2 = image->color2rgb("white");
@@ -1630,17 +1921,18 @@ void DumpImage::create_image()
       if (!objvec || !objarray) continue;
 
       // set color and transparency
-      double opacity = iobj.opacity;
+      double *white = image->color2rgb("white");
+      opacity = iobj.opacity;
       if (iobj.colorstyle == TYPE) {
         itype = static_cast<int>(objarray[i][0] - 1.0) % ntypes + 1;
-        color = colortype[itype];
+        color = (itype > 0) ? colortype[itype] : white;
       } else if (iobj.colorstyle == ELEMENT) {
         itype = static_cast<int>(objarray[i][0] - 1.0) % ntypes + 1;
-        color = colorelement[itype];
+        color = (itype > 0) ? colorelement[itype] : white;
       } else if (iobj.colorstyle == CONSTANT) {
         color = iobj.rgb;
       } else {
-        color = image->color2rgb("white");
+        color = white;
         opacity = 1.0;
       }
 
@@ -1660,6 +1952,7 @@ void DumpImage::create_image()
         // @sjplimp for consistency this should be:
         // image->draw_cylinder(&objarray[i][1],&objarray[i][4],color,iobj.flag2,iobj.flag1);
         image->draw_cylinder(&objarray[i][1], &objarray[i][4], color, iobj.flag1, 3, opacity);
+
       } else if (objvec[i] == Graphics::TRI) {    // don't render surface meshes in 2d
         if (domain->dimension == 3) {
           p1 = &objarray[i][1];
@@ -1673,23 +1966,63 @@ void DumpImage::create_image()
             image->draw_cylinder(p3, p1, color, iobj.flag2, 3, opacity);
           }
         }
+
+      } else if (objvec[i] == Graphics::TRINORM) {    // don't render surface meshes in 2d
+        if (domain->dimension == 3) {
+          double *color2 = nullptr;
+          double *color3 = nullptr;
+          if (iobj.colorstyle == TYPE) {
+            itype = static_cast<int>(objarray[i][1] - 1.0) % ntypes + 1;
+            color2 = (itype > 0) ? colortype[itype] : white;
+            itype = static_cast<int>(objarray[i][2] - 1.0) % ntypes + 1;
+            color3 = (itype > 0) ? colortype[itype] : white;
+          } else if (iobj.colorstyle == ELEMENT) {
+            itype = static_cast<int>(objarray[i][1] - 1.0) % ntypes + 1;
+            color2 = (itype > 0) ? colorelement[itype] : white;
+            itype = static_cast<int>(objarray[i][2] - 1.0) % ntypes + 1;
+            color3 = (itype > 0) ? colorelement[itype] : white;
+          } else if (iobj.colorstyle == CONSTANT) {
+            color2 = iobj.rgb;
+            color3 = iobj.rgb;
+          } else {
+            color2 = color3 = image->color2rgb("white");
+            opacity = 1.0;
+          }
+
+          p1 = &objarray[i][3];
+          p2 = &objarray[i][6];
+          p3 = &objarray[i][9];
+          if (static_cast<int>(iobj.flag1) % 2) {
+            image->draw_trinorm(p1, p2, p3, &objarray[i][12], &objarray[i][15], &objarray[i][18],
+                                color, color2, color3, opacity);
+          } else {
+            image->draw_cylinder(p1, p2, color, iobj.flag2, 3, opacity);
+            image->draw_cylinder(p2, p3, color, iobj.flag2, 3, opacity);
+            image->draw_cylinder(p3, p1, color, iobj.flag2, 3, opacity);
+          }
+        }
+
       } else if (objvec[i] == Graphics::CYLINDER) {
         image->draw_cylinder(&objarray[i][1], &objarray[i][4], color, objarray[i][7] + iobj.flag2,
                              (int) iobj.flag1, opacity);
+
       } else if (objvec[i] == Graphics::TRIANGLE) {
         image->draw_triangle(&objarray[i][1], &objarray[i][4], &objarray[i][7], color, opacity);
+
       } else if (objvec[i] == Graphics::ARROW) {
         ArrowObj a(objarray[i][9]);
         a.draw(image, color, &objarray[i][1], objarray[i][7] + iobj.flag1, &objarray[i][4],
                objarray[i][8] + iobj.flag2, opacity);
+
       } else if (objvec[i] == Graphics::CONE) {
         ConeObj c(1.0, objarray[i][7] + iobj.flag2, objarray[i][8] + iobj.flag2,
                   (int) objarray[i][9]);
         c.draw(image, vec3{objarray[i][1], objarray[i][2], objarray[i][3]},
                vec3{objarray[i][4], objarray[i][5], objarray[i][6]}, color, opacity);
+
       } else if (objvec[i] == Graphics::PIXMAP) {
         // get pointer to pixmap buffer and get background transparency color
-        const auto *pixmap = (const unsigned char *) ubuf(objarray[i][6]).i;
+        const auto *pixmap = (const unsigned char *) ubuf(objarray[i][6]).i;    // NOLINT
         double transcolor[3] = {objarray[i][7], objarray[i][8], objarray[i][9]};
         if (iobj.flag1 == 0.0)    // coordinates are in box coordinates
           image->draw_pixmap(&objarray[i][1], (int) objarray[i][4], (int) objarray[i][5], pixmap,
@@ -1697,11 +2030,12 @@ void DumpImage::create_image()
         else    // coordinates are in image coordinates, ignore z
           image->draw_pixmap((int) objarray[i][1], (int) objarray[i][2], (int) objarray[i][4],
                              (int) objarray[i][5], pixmap, transcolor, objarray[i][10], opacity);
+
       } else if (objvec[i] == Graphics::BOND) {
         int type1 = static_cast<int>(objarray[i][0] - 1.0) % ntypes + 1;
         int type2 = static_cast<int>(objarray[i][1] - 1.0) % ntypes + 1;
         double *color1, *color2;
-        double opacity = iobj.opacity;
+        opacity = iobj.opacity;
         if (iobj.colorstyle == TYPE) {
           color1 = colortype[type1];
           color2 = colortype[type2];
@@ -1716,7 +2050,7 @@ void DumpImage::create_image()
           color2 = image->color2rgb("white");
         }
 
-        double diameter = 0.5;
+        diameter = 0.5;
         if (bdiam == ATOM) {
           if (adiam == NUMERIC) {
             diameter = adiamvalue;
@@ -1770,8 +2104,7 @@ void DumpImage::create_image()
     // for POINTS style we have the same code for all region styles
 
     if (reg.style == POINTS) {
-      int seed = (int) (platform::walltime() * 1000000) % 1000000;
-      RanMars rand(lmp, seed);
+      RanMars rand(lmp, POINT_CLOUD_SEED);
       double pos[3];
 
       double xoff = domain->boxlo[0];
@@ -1820,11 +2153,17 @@ void DumpImage::create_image()
           // inconsistent style. should not happen.
           if (!myreg) continue;
 
-          corners = cornerdata{
-              vec3{myreg->xlo, myreg->ylo, myreg->zlo}, vec3{myreg->xlo, myreg->ylo, myreg->zhi},
-              vec3{myreg->xlo, myreg->yhi, myreg->zhi}, vec3{myreg->xlo, myreg->yhi, myreg->zlo},
-              vec3{myreg->xhi, myreg->ylo, myreg->zlo}, vec3{myreg->xhi, myreg->ylo, myreg->zhi},
-              vec3{myreg->xhi, myreg->yhi, myreg->zhi}, vec3{myreg->xhi, myreg->yhi, myreg->zlo}};
+          // clamp region boundaries to box boundaries
+          double xlo = MAX(myreg->xlo, domain->boxlo[0]);
+          double ylo = MAX(myreg->ylo, domain->boxlo[1]);
+          double zlo = MAX(myreg->zlo, domain->boxlo[2]);
+          double xhi = MIN(myreg->xhi, domain->boxhi[0]);
+          double yhi = MIN(myreg->yhi, domain->boxhi[1]);
+          double zhi = MIN(myreg->zhi, domain->boxhi[2]);
+
+          corners = cornerdata{vec3{xlo, ylo, zlo}, vec3{xlo, ylo, zhi}, vec3{xlo, yhi, zhi},
+                               vec3{xlo, yhi, zlo}, vec3{xhi, ylo, zlo}, vec3{xhi, ylo, zhi},
+                               vec3{xhi, yhi, zhi}, vec3{xhi, yhi, zlo}};
         }
 
         if (regstyle == "prism") {
@@ -1832,24 +2171,31 @@ void DumpImage::create_image()
           // inconsistent style. should not happen.
           if (!myreg) continue;
 
-          corners = cornerdata{
-              vec3{myreg->xlo, myreg->ylo, myreg->zlo},
-              vec3{myreg->xlo + myreg->xz, myreg->ylo + myreg->yz, myreg->zhi},
-              vec3{myreg->xlo + myreg->xy + myreg->xz, myreg->yhi + myreg->yz, myreg->zhi},
-              vec3{myreg->xlo + myreg->xy, myreg->yhi, myreg->zlo},
-              vec3{myreg->xhi, myreg->ylo, myreg->zlo},
-              vec3{myreg->xhi + myreg->xz, myreg->ylo + myreg->yz, myreg->zhi},
-              vec3{myreg->xhi + myreg->xy + myreg->xz, myreg->yhi + myreg->yz, myreg->zhi},
-              vec3{myreg->xhi + myreg->xy, myreg->yhi, myreg->zlo}};
+          // clamp region boundaries to box boundaries
+          double xlo = MAX(myreg->xlo, domain->boxlo[0]);
+          double ylo = MAX(myreg->ylo, domain->boxlo[1]);
+          double zlo = MAX(myreg->zlo, domain->boxlo[2]);
+          double xhi = MIN(myreg->xhi, domain->boxhi[0]);
+          double yhi = MIN(myreg->yhi, domain->boxhi[1]);
+          double zhi = MIN(myreg->zhi, domain->boxhi[2]);
+
+          corners = cornerdata{vec3{xlo, ylo, zlo},
+                               vec3{xlo + myreg->xz, ylo + myreg->yz, zhi},
+                               vec3{xlo + myreg->xy + myreg->xz, yhi + myreg->yz, zhi},
+                               vec3{xlo + myreg->xy, yhi, zlo},
+                               vec3{xhi, ylo, zlo},
+                               vec3{xhi + myreg->xz, ylo + myreg->yz, zhi},
+                               vec3{xhi + myreg->xy + myreg->xz, yhi + myreg->yz, zhi},
+                               vec3{xhi + myreg->xy, yhi, zlo}};
         }
 
         for (int i = 0; i < 8; ++i)
           reg.ptr->forward_transform(corners[i][0], corners[i][1], corners[i][2]);
 
-#define DRAW_CYLINDER(i, j) \
-  image->draw_cylinder(corners[i].data(), corners[j].data(), reg.color, reg.diameter, 3, 1.0)
-#define DRAW_TRIANGLE(i, j, k) \
-  image->draw_triangle(corners[i].data(), corners[j].data(), corners[k].data(), reg.color, opacity)
+#define DRAW_CYLINDER(j, k) \
+  image->draw_cylinder(corners[j].data(), corners[k].data(), reg.color, reg.diameter, 3, 1.0)
+#define DRAW_TRIANGLE(j, k, l) \
+  image->draw_triangle(corners[j].data(), corners[k].data(), corners[l].data(), reg.color, opacity)
 
         if (reg.style == FRAME) {
           DRAW_CYLINDER(0, 1);
@@ -1865,7 +2211,7 @@ void DumpImage::create_image()
           DRAW_CYLINDER(4, 7);
           DRAW_CYLINDER(6, 7);
         } else if ((reg.style == FILLED) || (reg.style == TRANSPARENT)) {
-          double opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
+          opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
           if (!reg.ptr->open_faces[0]) {
             DRAW_TRIANGLE(0, 1, 2);
             DRAW_TRIANGLE(2, 3, 0);
@@ -1907,21 +2253,29 @@ void DumpImage::create_image()
           // inconsistent style. should not happen.
           if (!myreg) continue;
 
-          length = myreg->hi - myreg->lo;
           radiuslo = myreg->radiuslo;
           radiushi = myreg->radiushi;
           if (myreg->axis == 'x') {
             xdir = 1.0;
-            lo = {myreg->lo, myreg->c1, myreg->c2};
-            hi = {myreg->hi, myreg->c1, myreg->c2};
+            double xlo = MAX(myreg->lo, domain->boxlo[0]);
+            double xhi = MIN(myreg->hi, domain->boxhi[0]);
+            length = xhi - xlo;
+            lo = {xlo, myreg->c1, myreg->c2};
+            hi = {xhi, myreg->c1, myreg->c2};
           } else if (myreg->axis == 'y') {
             ydir = 1.0;
-            lo = {myreg->c1, myreg->lo, myreg->c2};
-            hi = {myreg->c1, myreg->hi, myreg->c2};
+            double ylo = MAX(myreg->lo, domain->boxlo[1]);
+            double yhi = MIN(myreg->hi, domain->boxhi[1]);
+            length = yhi - ylo;
+            lo = {myreg->c1, ylo, myreg->c2};
+            hi = {myreg->c1, yhi, myreg->c2};
           } else {    // myreg->axis == 'z'
             zdir = 1.0;
-            lo = {myreg->c1, myreg->c2, myreg->lo};
-            hi = {myreg->c1, myreg->c2, myreg->hi};
+            double zlo = MAX(myreg->lo, domain->boxlo[2]);
+            double zhi = MIN(myreg->hi, domain->boxhi[2]);
+            length = zhi - zlo;
+            lo = {myreg->c1, myreg->c2, zlo};
+            hi = {myreg->c1, myreg->c2, zhi};
           }
         }
 
@@ -1936,16 +2290,25 @@ void DumpImage::create_image()
           radiushi = myreg->radius;
           if (myreg->axis == 'x') {
             xdir = 1.0;
-            lo = {myreg->lo, myreg->c1, myreg->c2};
-            hi = {myreg->hi, myreg->c1, myreg->c2};
+            double xlo = MAX(myreg->lo, domain->boxlo[0]);
+            double xhi = MIN(myreg->hi, domain->boxhi[0]);
+            length = xhi - xlo;
+            lo = {xlo, myreg->c1, myreg->c2};
+            hi = {xhi, myreg->c1, myreg->c2};
           } else if (myreg->axis == 'y') {
             ydir = 1.0;
-            lo = {myreg->c1, myreg->lo, myreg->c2};
-            hi = {myreg->c1, myreg->hi, myreg->c2};
+            double ylo = MAX(myreg->lo, domain->boxlo[1]);
+            double yhi = MIN(myreg->hi, domain->boxhi[1]);
+            length = yhi - ylo;
+            lo = {myreg->c1, ylo, myreg->c2};
+            hi = {myreg->c1, yhi, myreg->c2};
           } else {    // myreg->axis == 'z'
             zdir = 1.0;
-            lo = {myreg->c1, myreg->c2, myreg->lo};
-            hi = {myreg->c1, myreg->c2, myreg->hi};
+            double zlo = MAX(myreg->lo, domain->boxlo[2]);
+            double zhi = MIN(myreg->hi, domain->boxhi[2]);
+            length = zhi - zlo;
+            lo = {myreg->c1, myreg->c2, zlo};
+            hi = {myreg->c1, myreg->c2, zhi};
           }
         }
 
@@ -1966,7 +2329,7 @@ void DumpImage::create_image()
 
         // determine draw style flags
         int drawflag = (reg.style == FRAME) ? 2 : 1;
-        double opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
+        opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
 
         ConeObj c(length, radiushi, radiuslo, faceflag,
                   (reg.style == FRAME) ? RESOLUTION : 2 * RESOLUTION);
@@ -2004,7 +2367,7 @@ void DumpImage::create_image()
 
         // determine draw style flags
         int flag = 1;
-        double opacity = 1.0;
+        opacity = 1.0;
         if (reg.style == FRAME) {
           flag = 2;
         } else if (reg.style == TRANSPARENT) {
@@ -2030,17 +2393,54 @@ void DumpImage::create_image()
           double radius[3] = {myreg->radius, myreg->radius, myreg->radius};
           EllipsoidObj(4).draw(image, 2, reg.color, center, radius, reg.ptr, reg.diameter, 1.0);
         } else if ((reg.style == FILLED) || (reg.style == TRANSPARENT)) {
-          double opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
+          opacity = (reg.style == TRANSPARENT) ? reg.opacity : 1.0;
           myreg->forward_transform(center[0], center[1], center[2]);
           image->draw_sphere(center, reg.color, 2.0 * myreg->radius, opacity);
         }
 
       } else {
-        if (comm->me == 0)
-          error->warning(FLERR, "Region style {} is not yet supported by dump image", regstyle);
+        if (domain->dimension == 3) {
+          // we approximate other region styles by creating a point cloud then
+          // constructing a convex hull from that.
+          RanMars rand(lmp, POINT_CLOUD_SEED);
+
+          double xoff = domain->boxlo[0];
+          double yoff = domain->boxlo[1];
+          double zoff = domain->boxlo[2];
+          double xlen = domain->xprd;
+          double ylen = domain->yprd;
+          double zlen = domain->zprd;
+          if (domain->triclinic) {
+            xoff = domain->boxlo_bound[0];
+            yoff = domain->boxlo_bound[1];
+            zoff = domain->boxlo_bound[2];
+            xlen = domain->boxhi_bound[0] - domain->boxlo_bound[0];
+            ylen = domain->boxhi_bound[1] - domain->boxlo_bound[1];
+            zlen = domain->boxhi_bound[2] - domain->boxlo_bound[2];
+          }
+
+          std::vector<vec3> pts;
+          vec3 pos;
+          const int np = reg.npoints ? reg.npoints : DEFAULT_HULL_POINTS;
+          for (int i = 0; i < np; ++i) {
+            pos[0] = rand.uniform() * xlen + xoff;
+            pos[1] = rand.uniform() * ylen + yoff;
+            pos[2] = rand.uniform() * zlen + zoff;
+            if (reg.ptr->match(pos[0], pos[1], pos[2])) pts.push_back(pos);
+          }
+          ConvexHullObj hull;
+          hull.build(pts, true, 7.5);
+          hull.draw(image, (reg.style == FRAME) ? 2 : 1, reg.color, reg.diameter,
+                    (reg.style == TRANSPARENT) ? reg.opacity : 1.0);
+
+        } else {
+          if (comm->me == 0)
+            error->warning(FLERR, "Region style {} in 2d is not supported by dump image", regstyle);
+        }
       }
     }
   }
+
   // clang-format off
 
   // render outline of my sub-box, orthogonal or triclinic
@@ -2332,6 +2732,26 @@ void *DumpImage::extract(const char *str, int &dim)
   return nullptr;
 }
 
+/* ----------------------------------------------------------------------
+   return 1 if the colormap with the given index is actually used to color
+   something in this dump image, otherwise return 0.  Used by callers such
+   as fix graphics/labels to warn about color scale labels for unused maps.
+------------------------------------------------------------------------- */
+
+int DumpImage::colormap_active(int mapidx)
+{
+  switch (mapidx) {
+    case Image::ATOM_MAP:    // atoms (and bonds colored by atom) mapped by value
+      return (acolor == ATTRIBUTE) ? 1 : 0;
+    case Image::GRID_MAP:    // grid cells colored by value
+      return gridflag ? 1 : 0;
+    case Image::BOND_MAP:    // bonds colored by a per-bond /local compute value
+      return ((bondflag == YES) && (bcolor == LOCALVALUE)) ? 1 : 0;
+    default:
+      return 0;
+  }
+}
+
 /* ---------------------------------------------------------------------- */
 
 int DumpImage::modify_param(int narg, char **arg)
@@ -2360,7 +2780,7 @@ int DumpImage::modify_param(int narg, char **arg)
 
     int m = 0;
     for (int i = nlo; i <= nhi; i++) {
-      colortype[i] = image->color2rgb(colors[m%ncolors].c_str());
+      colortype[i] = image->color2rgb(colors[m%ncolors]);
       if (colortype[i] == nullptr)
         error->all(FLERR,argoff+2,"Invalid color in dump_modify acolor command {}", arg[2]);
       m++;
@@ -2390,25 +2810,27 @@ int DumpImage::modify_param(int narg, char **arg)
     return 3;
   }
 
-  if ((strcmp(arg[0],"amap") == 0) || (strcmp(arg[0],"gmap") == 0)) {
-    if (narg < 6) utils::missing_cmd_args(FLERR, "dump_modify amap/gmap", error);
+  if ((strcmp(arg[0],"amap") == 0) || (strcmp(arg[0],"gmap") == 0) ||
+      (strcmp(arg[0],"bmap") == 0)) {
+    if (narg < 6) utils::missing_cmd_args(FLERR, "dump_modify amap/gmap/bmap", error);
     if (strlen(arg[3]) != 2)
-      error->all(FLERR,argoff+3, "Incorrect dump_modify amap/gmap colormap style {}", arg[3]);
+      error->all(FLERR,argoff+3, "Incorrect dump_modify amap/gmap/bmap colormap style {}", arg[3]);
     int factor = 0;
     if (arg[3][0] == 's') factor = 1;
     else if (arg[3][0] == 'c') factor = 2;
     else if (arg[3][0] == 'd') factor = 3;
-    else error->all(FLERR,argoff+3, "Unknown dump_modify amap/gmap color map type {}", arg[3][0]);
+    else error->all(FLERR,argoff+3, "Unknown dump_modify amap/gmap/bmap color map type {}", arg[3][0]);
     int nentry = utils::inumeric(FLERR,arg[5],false,lmp);
     if (nentry < 1)
-      error->all(FLERR, argoff+5, "Must have at least 1 color map entry for dump_modify amap/gmap");
+      error->all(FLERR, argoff+5, "Must have at least 1 color map entry for dump_modify amap/gmap/bmap");
     n = 6 + factor*nentry;
-    if (narg < n)  utils::missing_cmd_args(FLERR, "dump_modify amap/gmap", error);
+    if (narg < n)  utils::missing_cmd_args(FLERR, "dump_modify amap/gmap/bmap", error);
     int flag = 0;
-    if (strcmp(arg[0], "amap") == 0) flag = image->map_reset(0, n-1, &arg[1]);
-    if (strcmp(arg[0], "gmap") == 0) flag = image->map_reset(1, n-1, &arg[1]);
+    if (strcmp(arg[0], "amap") == 0) flag = image->map_reset(Image::ATOM_MAP, n-1, &arg[1]);
+    if (strcmp(arg[0], "gmap") == 0) flag = image->map_reset(Image::GRID_MAP, n-1, &arg[1]);
+    if (strcmp(arg[0], "bmap") == 0) flag = image->map_reset(Image::BOND_MAP, n-1, &arg[1]);
     if (flag)
-      error->all(FLERR, argoff+flag, "Invalid map settings in dump_modify amap/gmap command");
+      error->all(FLERR, argoff+flag, "Invalid map settings in dump_modify amap/gmap/bmap command");
 
     return n;
   }
@@ -2430,7 +2852,7 @@ int DumpImage::modify_param(int narg, char **arg)
 
     int m = 0;
     for (int i = nlo; i <= nhi; i++) {
-      bcolortype[i] = image->color2rgb(colors[m%ncolors].c_str());
+      bcolortype[i] = image->color2rgb(colors[m%ncolors]);
       if (bcolortype[i] == nullptr)
         error->all(FLERR, argoff + 2, "Invalid color in dump_modify bcolor command");
       m++;
@@ -2528,12 +2950,24 @@ int DumpImage::modify_param(int narg, char **arg)
   }
 
   if (strcmp(arg[0],"color") == 0) {
-    if (narg < 5) utils::missing_cmd_args(FLERR, "dump_modify color", error);
-    int flag = image->addcolor(arg[1],utils::numeric(FLERR,arg[2],false,lmp),
-                               utils::numeric(FLERR,arg[3],false,lmp),
-                               utils::numeric(FLERR,arg[4],false,lmp));
-    if (flag) error->all(FLERR, argoff + 1 + flag, "Incorrect dump_modify color command");
-    return 5;
+    if (narg < 3) utils::missing_cmd_args(FLERR, "dump_modify color", error);
+    if (utils::strmatch(arg[2], "^0x[0-9a-fA-F]+$")) {
+      char *ptr = nullptr;
+      auto val = strtol(arg[2], &ptr, 16);
+      double rval =  ((val & 0xff0000) >> 16) / 255.0;
+      double gval =  ((val & 0x00ff00) >> 8) / 255.0;
+      double bval =  (val & 0x0000ff) / 255.0;
+      int flag = image->addcolor(arg[1], rval, gval, bval);
+      if (flag) error->all(FLERR, argoff + 1 + flag, "Incorrect dump_modify color command");
+      return 3;
+    } else {
+      if (narg < 5) utils::missing_cmd_args(FLERR, "dump_modify color", error);
+      int flag = image->addcolor(arg[1],utils::numeric(FLERR,arg[2],false,lmp),
+                                 utils::numeric(FLERR,arg[3],false,lmp),
+                                 utils::numeric(FLERR,arg[4],false,lmp));
+      if (flag) error->all(FLERR, argoff + 1 + flag, "Incorrect dump_modify color command");
+      return 5;
+    }
   }
 
   if (strcmp(arg[0],"ccolor") == 0) {
@@ -2596,6 +3030,285 @@ int DumpImage::modify_param(int narg, char **arg)
     }
     if (!match) error->all(FLERR, argoff + 1, "Fix ID {} is not included in dump {}", arg[1], id);
     return 3;
+  }
+
+  if (strcmp(arg[0],"gtrans") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify gtrans", error);
+    // ignore if grids are not displayed
+    if (gridflag == NO) return 2;
+    grid_opacity = utils::numeric(FLERR,arg[1],false,lmp);
+    if ((grid_opacity < 0.0) || (grid_opacity > 1.0))
+      error->all(FLERR, argoff + 1, "Invalid gtrans opacity in dump_modify command");
+    return 2;
+  }
+
+  // clang-format on
+  if (strcmp(arg[0], "lights") == 0) {
+    if (narg < 5) utils::missing_cmd_args(FLERR, "dump_modify lights", error);
+    double ambient = utils::numeric(FLERR, arg[1], false, lmp);
+    if ((ambient < 0.0) || (ambient > 1.0))
+      error->all(FLERR, argoff + 1, "Illegal ambient light value {}", ambient);
+    double key = utils::numeric(FLERR, arg[2], false, lmp);
+    if ((key < 0.0) || (key > 1.0))
+      error->all(FLERR, argoff + 2, "Illegal key light value {}", key);
+    double fill = utils::numeric(FLERR, arg[3], false, lmp);
+    if ((fill < 0.0) || (fill > 1.0))
+      error->all(FLERR, argoff + 3, "Illegal fill light value {}", fill);
+    double back = utils::numeric(FLERR, arg[4], false, lmp);
+    if ((back < 0.0) || (back > 1.0))
+      error->all(FLERR, argoff + 4, "Illegal back light value {}", back);
+
+    restore_lighting({ambient, key, fill, back}, image);
+
+    return 5;
+  }
+
+  if (strcmp(arg[0], "gamma") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify gamma", error);
+    double gval = utils::numeric(FLERR, arg[1], false, lmp);
+    if ((gval < 0.1) || (gval > 10.0))
+      error->all(FLERR, argoff + 1, "Illegal gamma value {}", gval);
+    image->gamma = gval;
+    return 2;
+  }
+
+  if (strcmp(arg[0], "ssaosamples") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify ssaosamples", error);
+    int nsamples = utils::inumeric(FLERR, arg[1], false, lmp);
+    if ((nsamples < 4) || (nsamples > 64))
+      error->all(FLERR, argoff + 1, "Illegal ssaosamples value {}", nsamples);
+    image->ssaosamples = nsamples;
+    return 2;
+  }
+
+  if (strcmp(arg[0], "specular") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify specular", error);
+    if (strcmp(arg[1], "none") == 0) {
+      image->nospecular = 1;
+      image->specularIntensity = 0.0;
+      return 2;
+    }
+    if (strcmp(arg[1], "wide") == 0)
+      image->specularHardness = 10.0;
+    else if (strcmp(arg[1], "narrow") == 0)
+      image->specularHardness = 50.0;
+    else if (strcmp(arg[1], "tight") == 0)
+      image->specularHardness = 250.0;
+    else
+      error->all(FLERR, argoff + 1, "Unknown specular setting {}", arg[1]);
+    image->specularflag = 1;
+    image->nospecular = 0;
+    image->specularIntensity = image->shiny;
+    return 2;
+  }
+
+  if (strcmp(arg[0], "metal") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify metal", error);
+    double mval = utils::numeric(FLERR, arg[1], false, lmp);
+    if ((mval < 0.0) || (mval > 1.0))
+      error->all(FLERR, argoff + 1, "Illegal metal value {}", mval);
+    image->metallic = mval;
+    return 2;
+  }
+
+  if (strcmp(arg[0], "metalfinish") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify metalfinish", error);
+    if (strcmp(arg[1], "satin") == 0) {
+      image->finishMirror = 0;
+      image->finishBand = 0.6;
+      image->finishWidth = 2.0;
+    } else if (strcmp(arg[1], "polished") == 0) {
+      image->finishMirror = 0;
+      image->finishBand = 0.6;
+      image->finishWidth = 4.0;
+    } else if (strcmp(arg[1], "mirror") == 0) {
+      image->finishMirror = 1;
+      image->finishBand = 0.4;
+      image->finishWidth = 3.0;
+    } else {
+      error->all(FLERR, argoff + 1, "Unknown metalfinish setting {}", arg[1]);
+    }
+    return 2;
+  }
+
+  if (strcmp(arg[0], "savecolors") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify savecolors", error);
+
+    if (comm->me == 0) {
+      SafeFilePtr fp = fopen(arg[1], "w");
+      if (fp == nullptr)
+        error->one(FLERR, argoff + 1, "Cannot open color JSON file {} for writing: {}", arg[1],
+                   utils::getsyserror());
+
+      json colordata;
+      colordata["application"] = "LAMMPS";
+      colordata["format"] = "colors";
+      colordata["revision"] = 1;
+      colordata["title"] = "per-type colors for dump image";
+      colordata["schema"] = "https://download.lammps.org/json/color-schema.json";
+      // store per-type colors
+      std::unordered_set<std::string> usedcolors;
+      for (int i = 1; i <= atom->ntypes; ++i) {
+        // lookup color name but avoid using the same name twice
+        auto name = image->rgb2color(colortype[i]);
+        if (name.empty() || (usedcolors.find(name) != usedcolors.end()))
+          name = fmt::format("type{}", i);
+        usedcolors.insert(name);
+
+        colordata["colors"][i - 1]["name"] = name;
+        colordata["colors"][i - 1]["red"] = colortype[i][0];
+        colordata["colors"][i - 1]["green"] = colortype[i][1];
+        colordata["colors"][i - 1]["blue"] = colortype[i][2];
+      }
+      // store lights
+      colordata["lights"]["ambient"] = image->ambientColor[0];
+      colordata["lights"]["key"] = image->keyLightColor[0];
+      colordata["lights"]["fill"] = image->fillLightColor[0];
+      colordata["lights"]["back"] = image->backLightColor[0];
+      auto formatted = colordata.dump(4);
+      (void) fputs(formatted.c_str(), fp);
+    }
+    return 2;
+  }
+
+  if (strcmp(arg[0], "loadcolors") == 0) {
+    if (narg < 2) utils::missing_cmd_args(FLERR, "dump_modify loadcolors", error);
+
+    json colordata;
+    std::vector<uint8_t> jsondata;
+    int jsondata_size = 0;
+
+    if (comm->me == 0) {
+      SafeFilePtr fp = fopen(arg[1], "r");
+      if (fp == nullptr)
+        error->one(FLERR, argoff + 1, "Cannot open color JSON file {} for reading: {}", arg[1],
+                   utils::getsyserror());
+      try {
+        // try to parse as a JSON file. parser throws an exception on errors
+        // if successful, temporarily serialize to bytearray for communication
+        colordata = json::parse(fp);
+        jsondata = json::to_ubjson(colordata);
+        jsondata_size = jsondata.size();
+      } catch (std::exception &e) {
+        error->one(FLERR, argoff + 1, "Error parsing color JSON file {}: {}", arg[1], e.what());
+      }
+    }
+    MPI_Bcast(&jsondata_size, 1, MPI_INT, 0, world);
+
+    if (jsondata_size > 0) {
+
+      // broadcast binary JSON data to all processes and deserialize again
+
+      if (comm->me != 0) jsondata.resize(jsondata_size);
+      MPI_Bcast(jsondata.data(), jsondata_size, MPI_CHAR, 0, world);
+
+      // convert back to json class on all processors and free temporary storage
+      colordata.clear();
+      colordata = json::from_ubjson(jsondata);
+      jsondata.clear();    // free binary data
+
+      // process JSON data
+      if (colordata.contains("application")) {
+        if (colordata["application"] != "LAMMPS")
+          error->all(FLERR, argoff + 1, "JSON color file {} is for incompatible application: {}",
+                     arg[1], std::string(colordata["application"]));
+      } else {
+        error->all(FLERR, argoff + 1,
+                   "JSON color file {} does not contain required \"application\" field", arg[1]);
+      }
+      if (colordata.contains("format")) {
+        if (colordata["format"] != "colors")
+          error->all(FLERR, argoff + 1, "JSON file {} does not contain colors: {}", arg[1],
+                     std::string(colordata["format"]));
+      } else {
+        error->all(FLERR, argoff + 1,
+                   "JSON color file {} does not contain required \"format\" field", arg[1]);
+      }
+      if (colordata.contains("revision")) {
+        int rev = colordata["revision"];
+        if ((rev < 1) || (rev > 1))
+          error->all(FLERR, argoff + 1, "JSON color file {} with unsupported revision {}", arg[1],
+                     rev);
+      } else {
+        error->all(FLERR, argoff + 1,
+                   "JSON color file {} does not contain required \"revision\" field", arg[1]);
+      }
+
+      if (!colordata.contains("colors"))
+        error->all(FLERR, argoff + 1,
+                   "JSON color file {} does not contain required \"colors\" field", arg[1]);
+
+      int ncolors = colordata["colors"].size();
+      if (comm->me == 0) {
+        std::string title;
+        if (colordata.contains("title"))
+          title = std::string(": ") + std::string(colordata["title"]);
+        utils::logmesg(lmp, "Read JSON color file {} with {} colors{}\n", arg[1], ncolors, title);
+      }
+
+      if (ncolors > 0) {
+
+        // reset all named colors from JSON data
+        for (const auto &c : colordata["colors"]) {
+          if (!c.contains("name")) continue;
+          std::string name = c["name"];
+          double r = 0.0;
+          double g = 0.0;
+          double b = 0.0;
+          if (c.contains("red")) r = c["red"];
+          if (c.contains("green")) g = c["green"];
+          if (c.contains("blue")) b = c["blue"];
+          if (int i = image->addcolor(name, r, g, b)) {
+            error->all(FLERR, "Invalid value for {} component of color {}: {}\n",
+                       std::array<std::string, 4>{"none", "red", "green", "blue"}[i], name,
+                       std::array<double, 4>{0.0, r, g, b}[i]);
+          }
+        }
+        // create additional named colors, if needed
+        for (int itype = ncolors + 1; itype <= atom->ntypes; ++itype) {
+          std::string name = fmt::format("type{}", itype);
+          double r = 0.0;
+          double g = 0.0;
+          double b = 0.0;
+          int i = (itype - 1) % ncolors;
+          const auto &c = colordata["colors"][i];
+          if (c.contains("red")) r = c["red"];
+          if (c.contains("green")) g = c["green"];
+          if (c.contains("blue")) b = c["blue"];
+          image->addcolor(name, r, g, b);
+        }
+        // set per-type colors. use a separate loop to avoid invalid pointers due to rehashes
+        for (int itype = 1; itype <= atom->ntypes; ++itype) {
+          std::string name = fmt::format("type{}", itype);
+          int i = (itype - 1) % ncolors;
+          const auto &c = colordata["colors"][i];
+          // if we have more types than colors, don't use the name but use type<itype>
+          // the corresponding entry has been created in the previous loop
+          if (itype <= ncolors)
+            if (c.contains("name")) name = c["name"];
+          auto *rgb = image->color2rgb(name);
+          if (rgb) colortype[itype] = rgb;
+        }
+      }
+
+      // apply lights, if present
+      if (colordata.contains("lights")) {
+        savedLights lights;
+        lights.ambient = image->ambientColor[0];
+        lights.key = image->keyLightColor[0];
+        lights.fill = image->fillLightColor[0];
+        lights.back = image->backLightColor[0];
+        if (colordata["lights"].contains("ambient"))
+          lights.ambient = colordata["lights"]["ambient"];
+        if (colordata["lights"].contains("key")) lights.key = colordata["lights"]["key"];
+        if (colordata["lights"].contains("fill")) lights.fill = colordata["lights"]["fill"];
+        if (colordata["lights"].contains("back")) lights.back = colordata["lights"]["back"];
+        restore_lighting(lights, image);
+      }
+    } else {
+      error->all(FLERR, argoff + 1, "Color file {} does not contain JSON data", arg[1]);
+    }
+    return 2;
   }
 
   return 0;

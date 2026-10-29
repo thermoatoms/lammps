@@ -64,7 +64,7 @@ BodyRoundedPolyhedron::BodyRoundedPolyhedron(LAMMPS *lmp, int narg, char **arg) 
   maxexchange = 3 + 3*nmax+2*nmax+MAX_FACE_SIZE*nmax+1+1;  // icp max + dcp max
 
   memory->create(imflag,3*nmax,"body/rounded/polyhedron:imflag");
-  memory->create(imdata,3*nmax,9,"body/rounded/polyhedron:imdata");
+  memory->create(imdata,3*nmax,18,"body/rounded/polyhedron:imdata");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -208,11 +208,11 @@ void BodyRoundedPolyhedron::data_body(int ibonus, int ninteger, int ndouble,
   // nsub > 2:
   //   6 for inertia + 3*nsub + 2*nedges + MAX_FACE_SIZE*nfaces + 1 for rounded radius
 
-  int nedges,nentries;
+  int nedges = ned;
+  int nentries;
   if (nsub < 3) {
     nentries = 6 + 3*nsub + 1;
   } else {
-    nedges = ned; //nsub + nfac - 2;
     nentries = 6 + 3*nsub + 2*nedges + MAX_FACE_SIZE*nfac + 1;
   }
 
@@ -322,6 +322,9 @@ void BodyRoundedPolyhedron::data_body(int ibonus, int ninteger, int ndouble,
   // rods have just 1 edge
 
   } else if (nsub == 2) {
+    if (MathExtra::distsq3(&dfile[6], &dfile[9]) == 0.0)
+      error->one(FLERR, "The two vertices of rod body {} in Bodies section of data file "
+                 "coincide", atom->tag[bonus->ilocal]);
     bonus->dvalue[k] = 0;
     bonus->dvalue[k+1] = 1;
     k += 2;
@@ -339,18 +342,39 @@ void BodyRoundedPolyhedron::data_body(int ibonus, int ninteger, int ndouble,
 
   } else {
 
-    // edges
+    // edges, which must connect two different vertices at different positions
 
+    const double *vfile = &dfile[6];
     for (i = 0; i < nedges; i++) {
+      int na = static_cast<int>(dfile[j]);
+      int nb = static_cast<int>(dfile[j+1]);
+      if ((na < 0) || (na >= nsub) || (nb < 0) || (nb >= nsub) ||
+          (MathExtra::distsq3(&vfile[3*na], &vfile[3*nb]) == 0.0))
+        error->one(FLERR, "Edge {} of body {} in Bodies section of data file has invalid "
+                   "vertices or zero length", i, atom->tag[bonus->ilocal]);
       bonus->dvalue[k] = dfile[j];
       bonus->dvalue[k+1] = dfile[j+1];
       k += 2;
       j += 2;
     }
 
-    // faces
+    // faces, whose normal is computed from their first three vertices
 
     for (i = 0; i < nfac; i++) {
+      int nv[3];
+      for (m = 0; m < 3; m++) {
+        nv[m] = static_cast<int>(dfile[j+m]);
+        if ((nv[m] < 0) || (nv[m] >= nsub))
+          error->one(FLERR, "Face {} of body {} in Bodies section of data file has invalid "
+                     "vertices", i, atom->tag[bonus->ilocal]);
+      }
+      double u[3], v[3], n[3];
+      MathExtra::sub3(&vfile[3*nv[1]], &vfile[3*nv[0]], u);
+      MathExtra::sub3(&vfile[3*nv[2]], &vfile[3*nv[0]], v);
+      MathExtra::cross3(u, v, n);
+      if (MathExtra::lensq3(n) <= 1.0e-24 * MathExtra::lensq3(u) * MathExtra::lensq3(v))
+        error->one(FLERR, "The first three vertices of face {} of body {} in Bodies section "
+                   "of data file are on a line", i, atom->tag[bonus->ilocal]);
       for (m = 0; m < MAX_FACE_SIZE; m++)
         bonus->dvalue[k+m] = dfile[j+m];
       k += MAX_FACE_SIZE;
@@ -620,11 +644,20 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
   } else {
 
     // select whether edges or faces or both should be drawn
-    bool edgeflag = true;
+    bool edgeflag = false;
     bool triflag = true;
+    bool flatflag = false;
     int flag = static_cast<int>(flag2);
-    if (flag == 2) triflag = false;
-    if (flag == 1) edgeflag = false;
+    // default settings are for flag2 == 1
+    if (flag == 2) {
+      edgeflag = true;
+      triflag = false;
+    } else if (flag == 3) {
+      edgeflag = true;
+      flatflag = true;
+    } else if (flag == 4) {
+      flatflag = true;
+    }
 
     int nedges = bonus->ivalue[1];
     if (nvertices == 2) nedges = 1;                  // special case: just two vertices -> one rod
@@ -662,11 +695,12 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
         int pt2 = static_cast<int>(edge_ends[4*i+1]);
         int pt3 = static_cast<int>(edge_ends[4*i+2]);
         int pt4 = static_cast<int>(edge_ends[4*i+3]);
+        double tmpnormal[3];
 
         // quadrilateral face requires two triangles. triangle has fourth vertex index set to -1
         if (pt4 >= 0) {
           // first triangle
-          imflag[nelements] = Graphics::TRI;
+          imflag[nelements] = Graphics::TRINORM;
           MathExtra::matvec(p,&bonus->dvalue[3*pt1],imdata[nelements]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt2],&imdata[nelements][3]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt3],&imdata[nelements][6]);
@@ -679,10 +713,27 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
           imdata[nelements][6] += x[0];
           imdata[nelements][7] += x[1];
           imdata[nelements][8] += x[2];
+          MathExtra::matvec(p,&bonus->dvalue[3*pt1],&imdata[nelements][9]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt2],&imdata[nelements][12]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt3],&imdata[nelements][15]);
+          // tilt the normals toward the center of the square to make it more "edgy"
+          MathExtra::matvec(p,&bonus->dvalue[3*pt4],tmpnormal);
+          tmpnormal[0] += imdata[nelements][9] + imdata[nelements][12] + imdata[nelements][15];
+          tmpnormal[1] += imdata[nelements][10] + imdata[nelements][13] + imdata[nelements][16];
+          tmpnormal[2] += imdata[nelements][11] + imdata[nelements][14] + imdata[nelements][17];
+          MathExtra::scale3(0.5, tmpnormal);
+          for (int j = 0; j < 3; ++j) {
+            for (auto k : {9,12,15}) {
+              imdata[nelements][k+j] += tmpnormal[j];
+            }
+          }
+          MathExtra::norm3(&imdata[nelements][9]);
+          MathExtra::norm3(&imdata[nelements][12]);
+          MathExtra::norm3(&imdata[nelements][15]);
           ++nelements;
 
           // second triangle
-          imflag[nelements] = Graphics::TRI;
+          imflag[nelements] = Graphics::TRINORM;
           MathExtra::matvec(p,&bonus->dvalue[3*pt3],imdata[nelements]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt4],&imdata[nelements][3]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt1],&imdata[nelements][6]);
@@ -695,6 +746,24 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
           imdata[nelements][6] += x[0];
           imdata[nelements][7] += x[1];
           imdata[nelements][8] += x[2];
+          MathExtra::matvec(p,&bonus->dvalue[3*pt3],&imdata[nelements][9]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt4],&imdata[nelements][12]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt1],&imdata[nelements][15]);
+          // tilt the normals toward the center of the square to make it more "edgy"
+          for (int j = 0; j < 3; ++j) {
+            for (auto k : {9,12,15}) {
+              imdata[nelements][k+j] += tmpnormal[j];
+            }
+          }
+          MathExtra::norm3(&imdata[nelements][9]);
+          MathExtra::norm3(&imdata[nelements][12]);
+          MathExtra::norm3(&imdata[nelements][15]);
+
+          if (flatflag) {
+            // reset rounded triangles to flat triangles, if requested
+            imflag[nelements] = Graphics::TRI;
+            imflag[nelements-1] = Graphics::TRI;
+          }
 
           // shift triangles toward the outside of the body by half diameter when also drawing edges
           if (edgeflag) {
@@ -730,10 +799,10 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
             imdata[nelements-1][7] += vec2[1];
             imdata[nelements-1][8] += vec2[2];
           }
-
           ++nelements;
+
         } else {
-          imflag[nelements] = Graphics::TRI;
+          imflag[nelements] = Graphics::TRINORM;
           MathExtra::matvec(p,&bonus->dvalue[3*pt1],imdata[nelements]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt2],&imdata[nelements][3]);
           MathExtra::matvec(p,&bonus->dvalue[3*pt3],&imdata[nelements][6]);
@@ -746,6 +815,25 @@ int BodyRoundedPolyhedron::image(int ibonus, double flag1, double flag2,
           imdata[nelements][6] += x[0];
           imdata[nelements][7] += x[1];
           imdata[nelements][8] += x[2];
+          MathExtra::matvec(p,&bonus->dvalue[3*pt1],&imdata[nelements][9]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt2],&imdata[nelements][12]);
+          MathExtra::matvec(p,&bonus->dvalue[3*pt3],&imdata[nelements][15]);
+          // tilt the normals toward the center of the triangle to make it a bit "edgy"
+          tmpnormal[0] = imdata[nelements][9] + imdata[nelements][12] + imdata[nelements][15];
+          tmpnormal[1] = imdata[nelements][10] + imdata[nelements][13] + imdata[nelements][16];
+          tmpnormal[2] = imdata[nelements][11] + imdata[nelements][14] + imdata[nelements][17];
+          MathExtra::scale3(0.5, tmpnormal);
+          for (int j = 0; j < 3; ++j) {
+            for (auto k : {9,12,15}) {
+              imdata[nelements][k+j] += tmpnormal[j];
+            }
+          }
+          MathExtra::norm3(&imdata[nelements][9]);
+          MathExtra::norm3(&imdata[nelements][12]);
+          MathExtra::norm3(&imdata[nelements][15]);
+
+          // reset rounded triangles to flat triangles, if requested
+          if (flatflag) imflag[nelements] = Graphics::TRI;
 
           // shift triangle toward the outside of the body by half diameter when also drawing edges
           if (edgeflag) {

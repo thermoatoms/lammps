@@ -8,15 +8,16 @@ LAMMPS snapshots are created by the :doc:`dump <dump>` command, which
 can create files in several formats.  The native LAMMPS dump format is a
 text file (see :lammps:`dump atom` or :lammps:`dump custom`) which can
 be visualized by `several visualization tools
-<https://www.lammps.org/viz.html>`_ for MD simulation trajectories.
+<https://www.lammps.org/ecosystem/visualization/>`_ for MD simulation trajectories.
 `OVITO <https://www.ovito.org>`_ and `VMD
 <https://www.ks.uiuc.edu/Research/vmd/>`_ seem to be the most popular
 choices among them.
 
 The :doc:`dump image <dump_image>` and :doc:`dump movie <dump_image>`
 styles can output internally rendered images or convert them to a movie
-during the MD run.  It is also possible to create visualizations from
-LAMMPS inputs or restart file with `LAMMPS-GUI
+during the MD run.  They require LAMMPS to be compiled with the
+:ref:`GRAPHICS package <PKG-GRAPHICS>`.  It is also possible to create
+visualizations from LAMMPS inputs or restart file with `LAMMPS-GUI
 <https://lammps-gui.lammps.org/>`_, which uses the :doc:`dump image
 <dump_image>` command internally.  If the LAMMPS input already contains
 a :doc:`dump image <dump_image>` command, the resulting images will be
@@ -35,7 +36,7 @@ rarely needed these days.
 ------------------------
 
 Basic workflow for loading LAMMPS trajectories in VMD
-=====================================================
+-----------------------------------------------------
 
 VMD can read native LAMMPS dump files (in text format not binary) and
 several other dump styles.  The native LAMMPS format is preferred since
@@ -112,7 +113,7 @@ with "Load Visualization State..."  or type in the command console
 ------------------------
 
 Advanced graphics features in the *dump image* command
-======================================================
+------------------------------------------------------
 
 .. versionadded:: 11Feb2026
 
@@ -122,8 +123,8 @@ some input file examples.  For exact details of keywords and arguments,
 please refer to the detailed documentation of the respective commands.
 
 Please note that many of these features were added or significantly
-updated after LAMMPS version 10 Dec 2025 and well into the 2026 stable
-version development cycle.  If you are using an older version of LAMMPS,
+updated during the development cycle leading to the stable LAMMPS
+version 30 Sep 2026.  If you are using an older version of LAMMPS,
 these examples may likely cause errors or look differently.
 
 .. contents:: Available topics
@@ -132,7 +133,7 @@ these examples may likely cause errors or look differently.
 ------------
 
 Complete example inputs
------------------------
+^^^^^^^^^^^^^^^^^^^^^^^
 
 The discussions below only quote relevant sections of input files to
 show specifically the commands used in the visualizations.  There are
@@ -142,7 +143,7 @@ source code distribution.
 ---------------
 
 Image quality and resolution
-----------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The image resolution is determined by the *size* keyword.  The default
 setting is to create images with 512x512 pixels.  This is rather low
@@ -157,9 +158,9 @@ or 6x6 times larger to utilize the full resolution of the printer and
 show as much details and be as clean as possible.  Otherwise images have
 to be scaled up which can make them look blurry and with ragged edges.
 
-The keywords *fsaa* and *ssao* can be used to further improve the image
-quality at the expense of significant additional computational cost to
-render the images:
+The keywords *fsaa*, *ssao*, and *depthcue* can be used to further
+improve the image quality and realism at the expense of additional
+computational cost to render the images:
 
 - FSAA stands for `Full Scene Anti-Aliasing
   <https://en.wikipedia.org/wiki/Spatial_anti-aliasing#Super_sampling_/_full-scene_anti-aliasing>`_
@@ -177,11 +178,18 @@ render the images:
   selected pixels in its neighborhood based on that information.  This
   enhances the depth perception of objects in an image.
 
-Both methods are complementary and thus can be combined for additional
-improvement of the image quality.  The images below show from left to
-right the same excerpt of a dump image output with the default settings,
-with *fsaa* enabled, with *ssao* enabled, and with both features
-enabled.
+- Depth cueing adds a `distance fog gradient
+  <https://en.wikipedia.org/wiki/Distance_fog>`_ so objects further from
+  the camera are progressively more obscured by haze.  This technique
+  simulates the effect of light scattering, which causes more distant
+  objects to appear lower in contrast, especially in outdoor
+  environments, and thus enhances depth perception.
+
+The three methods are complementary and thus can be combined for
+additional improvement of the image quality.  The images below show from
+left to right the same excerpt of a dump image output with the default
+settings, with *fsaa* enabled, with *ssao* enabled in addition, and
+with *depthcue* added on top.
 
 .. |imagequality1| image:: JPG/image.default.png
    :width: 24%
@@ -189,7 +197,7 @@ enabled.
    :width: 24%
 .. |imagequality3| image:: JPG/image.ssao.png
    :width: 24%
-.. |imagequality4| image:: JPG/image.both.png
+.. |imagequality4| image:: JPG/image.depth.png
    :width: 24%
 
 |imagequality1|  |imagequality2|  |imagequality3|  |imagequality4|
@@ -197,8 +205,8 @@ enabled.
 The computational cost to create the images with :doc:`dump image
 <dump_image>` depends on the image size, the number of objects to be
 rendered (this number can grow quickly when using fine triangle meshes),
-and the choice of the *fsaa* and *ssao* settings.  For high resolution
-images, a correspondingly large image size has to be chosen.
+and the choice of the *fsaa*, *ssao*, and *depthcue* settings.  For high
+resolution images, a correspondingly large image size has to be chosen.
 
 Since the simulation has to wait for the dump image command to complete
 its image rendering, creating high resolution, high quality images can
@@ -214,37 +222,120 @@ parallelization available (e.g. for SSAO post-processing of image data).
 
 --------------------
 
+Shading style and outline
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The rasterizer in LAMMPS implements a `Phong shading model
+<https://en.wikipedia.org/wiki/Phong_shading>`_ that adds a specular
+highlight to objects which determines how the material of the objects is
+perceived.  The intensity of this effect is controlled by the *shiny*
+keyword of :doc:`dump image <dump_image>` and the material perception by
+the *specular* :doc:`dump_modify <dump_image>` setting.  Using a
+specular setting of `none` turns the specular highlight off and thus
+results in a matted material.  Using the settings `wide`, `narrow`, and
+`tight` reduces the diameter of the highlight and makes the material
+appear more polished.  In addition, there is also an *outline* image
+post-processing step that can add a colored outline to the graphics
+object and can make images more "schematic".  It works best when
+features to enhance image quality with the exception of FSAA are turned
+off.  The images below show from left to right the different specular
+settings (*none*, *wide*, *narrow*, *tight*) and the *outline* drawing
+style with a pixel width of 2 pixels (in gray).
+
+.. |shading1| image:: JPG/shade.none.png
+   :width: 19%
+.. |shading2| image:: JPG/shade.wide.png
+   :width: 19%
+.. |shading3| image:: JPG/shade.narrow.png
+   :width: 19%
+.. |shading4| image:: JPG/shade.tight.png
+   :width: 19%
+.. |shading5| image:: JPG/shade.outline.png
+   :width: 19%
+
+|shading1|  |shading2|  |shading3|  |shading4|  |shading5|
+
+.. admonition:: Transparent backgrounds
+   :class: Hint
+
+   The rasterizer in LAMMPS does not support a so-called "alpha channel"
+   in its rendering processing and thus has no native transparency.
+   This has practical benefits because it makes parallel rendering in
+   parallel convenient even when the objects are distributed across
+   parallel processes.  But another consequence is that it is not
+   possible to create images with a transparent background.  However,
+   adding a thin outline with a suitable color simplifies the process of
+   creating a transparent background in a image processing program. It
+   creates a clean separation between the foreground objects and the
+   background, so the background can be selected and removed.
+
+-------
+
 Color selection and color management
-------------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The :doc:`dump image <dump_image>` command in LAMMPS has a variety
 of options to assign colors to the rendered graphics.  In most cases
 the color is assigned to atom (or bond) types and uses a default map
-with six colors as follows:
+with 16 colors (which is repeated for more than 16 types) as follows:
 
 * type 1 = red
-* type 2 = green
+* type 2 = forestgreen
 * type 3 = blue
-* type 4 = yellow
+* type 4 = gold
 * type 5 = cyan
 * type 6 = magenta
+* type 7 = silver
+* type 8 = orange
+* type 9 = lime
+* type 10 = gray
+* type 11 = darkred
+* type 12 = darkgreen
+* type 13 = darkblue
+* type 14 = darkcyan
+* type 15 = darkmagenta
+* type 16 = darkgray
 
-and repeats itself for types :math:`> 6`.  This mapping can be changed by the
-"dump_modify acolor" command, though.  If you want to change the color of a
-specific atom type, you can use :doc:`dump modify acolor <dump_image>`.  For
-example to color atoms of type 1 in gray and type 2 in white, you would use:
+
+.. |color_red| image:: img/colors/red.png
+.. |color_forestgreen| image:: img/colors/forestgreen.png
+.. |color_blue| image:: img/colors/blue.png
+.. |color_gold| image:: img/colors/gold.png
+.. |color_cyan| image:: img/colors/cyan.png
+.. |color_magenta| image:: img/colors/magenta.png
+.. |color_silver| image:: img/colors/silver.png
+.. |color_orange| image:: img/colors/orange.png
+.. |color_lime| image:: img/colors/lime.png
+.. |color_gray| image:: img/colors/gray.png
+.. |color_darkred| image:: img/colors/darkred.png
+.. |color_darkgreen| image:: img/colors/darkgreen.png
+.. |color_darkblue| image:: img/colors/darkblue.png
+.. |color_darkcyan| image:: img/colors/darkcyan.png
+.. |color_darkmagenta| image:: img/colors/darkmagenta.png
+.. |color_darkgray| image:: img/colors/darkgray.png
+
+and repeats itself for types > 16. The default color sequence is thus:
+|color_red|       |color_forestgreen|  |color_blue|         |color_gold|
+|color_cyan|      |color_magenta|      |color_silver|       |color_orange|
+|color_lime|      |color_gray|         |color_darkred|      |color_darkgreen|
+|color_darkblue|  |color_darkcyan|     |color_darkmagenta|  |color_darkgray|
+
+This mapping can be changed by the "dump_modify acolor" command, though.
+If you want to change the color of a specific atom type, you can use
+:doc:`dump modify acolor <dump_image>`.  For example to color atoms of
+type 1 in gray and type 2 in white, you would use:
 
 .. code-block:: LAMMPS
 
    dump_modify img  acolor 1 gray acolor 2 white
 
-There are 144 predefined colors, but you can add new colors or modify
+There are 140 predefined colors, but you can add new colors or modify
 existing ones, too, with the *dump_modify color* keyword.  The *color*
 keyword is followed by the name of the color and the intensity of the
 red, green, and blue components (R/G/B) in a range from 0.0 to 1.0. Here
 is an example to create eight new color names followed by the *acolor*
-keyword with a wildcard to replace the default map of six atom colors
-with a new map of the either newly defined colors.
+keyword with a wildcard to replace the default map of 16 atom colors
+with a new map of the eight newly defined colors.
 
 .. code-block:: LAMMPS
 
@@ -275,7 +366,7 @@ the charge:
 .. code-block:: LAMMPS
 
    dump viz peptide image 1000 image-*.png q type size 600 600 zoom 2.0
-   dump_modify amap -1.0 1.0 ca 0 3 min blue 0.0 white max red
+   dump_modify viz amap -1.0 1.0 ca 0 3 min blue 0.0 white max red
 
 
 .. |colors1| image:: img/colors-default.png
@@ -291,14 +382,52 @@ the charge:
 
 .. raw:: html
 
-   <center>(Different colorization styles. Left to right: by default
+   <center>(Different colorization settings. Left to right: by default
    type map, by custom type map, by element, and by charge. Click to see
-   the full-size images)</center>
+   the full-size images)</center><br>
+
+.. versionchanged:: 4Jul2026
+
+Similar color selections are available for coloring bonds. The available
+options are: *type*, *atom*, *c_ID* (or *c_ID[I]*), and *none*.  With
+*type* the bonds are colored by having a color assigned to each bond
+type which follows the same color sequence as for atoms but can be set
+for each bond type independent from atom types.  When using the *atom*
+selection the bond color follows the color of the atoms.  Bonds are
+drawn in two pieces as a cylinder from the center of the bond to each of
+the atoms. Thus if two atoms have different color, the bond also as two
+parts with different colors with this setting.  If the a compute
+reference is used (e.g. *c_ID* or *c_ID[I]*) the bond color is taken
+from a colormap and the color depends on the value of the compute for
+the given bond.  An input example for coloring bonds by the force
+magnitude is given below. When the bond color argument is *none*, no
+bonds are drawn.
+
+.. code-block:: LAMMPS
+
+   compute  bforce peptide bond/local force
+   dump     viz    peptide image 100 myimage-*.png element type bond c_bforce type
+
+.. |bcolors1| image:: img/bondcolor-type.png
+   :width: 24%
+.. |bcolors2| image:: img/bondcolor-element.png
+   :width: 24%
+.. |bcolors3| image:: img/bondcolor-mapforce.png
+   :width: 24%
+.. |bcolors4| image:: img/bondcolor-none.png
+   :width: 24%
+
+|bcolors1|  |bcolors2|  |bcolors3|  |bcolors4|
+
+.. raw:: html
+
+   <center>(Different bond colorization settings. Left to right: by type, by element,
+   by bond force, and no bonds. Click to see the full-size images)</center>
 
 --------------------
 
 Transparency
-------------
+^^^^^^^^^^^^
 
 It is now possible to create approximately transparent graphics objects
 using an `ordered dithering algorithm
@@ -336,18 +465,19 @@ available and described in the documentation page.
 -----------------------
 
 Creating and viewing animated GIFs and movie files
---------------------------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 A series of JPEG, PNG, or PPM images can be converted into a movie file
 and then played as a movie using commonly available tools.  Using dump
 style *movie* automates this step *and* avoids the intermediate step of
 writing (many) image snapshot file.  But LAMMPS has to be compiled with
-``-DLAMMPS_FFMPEG`` and a compatible FFmpeg executable has to be
-installed.  When using `LAMMPS-GUI <https://lammps-gui.lammps.org/>`_ to
-run LAMMPS, you can run the simulation and LAMMPS-GUI will automatically
-show the created images in its ``Slideshow Viewer`` dialog.  From there
-you can animate or single step through them and also export them to a
-movie file via FFMpeg.
+the GRAPHICS package and a compatible `FFmpeg <https://ffmpeg.org>`_
+executable has to be installed.  When using `LAMMPS-GUI
+<https://lammps-gui.lammps.org/>`_ to run LAMMPS, you can run the
+simulation and LAMMPS-GUI will automatically show the created images
+in its ``Slideshow Viewer`` dialog.  From there you can animate or
+single step through them and also export them to a movie file via FFMpeg
+or `ImageMagick <https://imagemagick.org>`_.
 
 To manually convert JPEG, PNG or PPM files into an animated GIF or
 MPEG or other movie file you can use:
@@ -365,19 +495,9 @@ MPEG or other movie file you can use:
    inefficient compression and low quality compared to more modern
    compression styles like MPEG-4, H.264, VP8, VP9, H.265 and so on.
 
-#. Use QuickTime.
-
-   Select "Open Image Sequence" under the File menu Load the images into
-   QuickTime to animate them Select "Export" under the File menu Save the
-   movie as a QuickTime movie (\*.mov) or in another format.  QuickTime
-   can generate very high quality and efficiently compressed movie
-   files. Some of the supported formats require to buy a license and some
-   are not readable on all platforms until specific runtime libraries are
-   installed.
-
 #. Use FFmpeg
 
-   `FFMpeg <https://ffmpeg.org/>`_ is a command-line tool that is
+   `FFmpeg <https://ffmpeg.org/>`_ is a command-line tool that is
    available on many platforms and allows extremely flexible encoding
    and decoding of movies.
 
@@ -399,7 +519,7 @@ Play the movie:
    Load the animated GIF or MP4 movie file
 
 #. Use the freely available `VideoLAN media player (vlc)
-   <https://videolan.org>`_ or `FFMpeg player tool (ffplay)
+   <https://www.videolan.org>`_ or `FFmpeg player tool (ffplay)
    <https://ffmpeg.org/>`_ to view a movie.
 
    Both are available for multiple operating systems and support a large
@@ -411,8 +531,8 @@ Play the movie:
       vlc foo.mpg
       ffplay bar.avi
 
-#. Use the `Pizza.py <https://lammps.github.io/pizza/>`_
-   `animate tool <https://lammps.github.io/pizza/doc/animate.html>`_,
+#. Use the `Pizza.py <https://sjplimp.github.io/pizza/>`_
+   `animate tool <https://sjplimp.github.io/pizza/doc/animate.html>`_,
    which works directly on a series of image files.
 
    .. code-block:: python
@@ -429,7 +549,7 @@ Play the movie:
 --------------
 
 Prototyping dump image visualizations with LAMMPS-GUI
------------------------------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 One of the challenges when using :doc:`dump image <dump_image>` for
 creating visualizations compared to the likes of `OVITO
@@ -454,13 +574,14 @@ lines can be transferred to the cut-n-paste buffer of the windowing
 system and pasted into the input file and then further adjusted.
 
 Once the input contains a :doc:`dump image <dump_image>` command,
-LAMMPS-GUI will notice when a new image has been created and load it
-into "Slide Show Dialog".  This streamlines the process of building more
-complex visualizations once you have copied it into the input since you
-have editor and image viewer as part of the same program and can quickly
-start and stop LAMMPS with a mouse click or keystroke.  A large part of
-the visualization examples on shown in this Howto page have been created
-this way.
+LAMMPS-GUI notices when a new image has been created and loads it into
+the "Slide Show Dialog".  This streamlines the process of building more
+complex visualizations once you have copied an initial draft created
+with the "Image Viewer Dialog" into the input since you have editor and
+image viewer as part of the same program and can quickly start and stop
+LAMMPS with a mouse click or keystroke.  A large part of the
+visualization examples shown in this Howto page have been created this
+way.
 
 .. |gui1| image:: JPG/lammps-gui-main.png
    :width: 38%
@@ -474,17 +595,17 @@ this way.
 --------------
 
 Visualizing systems using potentials with implicit bonds
---------------------------------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 There are several pair styles available in LAMMPS where the bond
-information is not taken from from the bond topology in a data file but
-the potentials first determine a "bond-order" parameter for pairs of
-atoms and - depending on the value of that parameter - apply forces for
-bonded interactions.  This applies to :doc:`ReaxFF <pair_reaxff>`,
-:doc:`REBO and AIREBO <pair_airebo>`, :doc:`BOP <pair_bop>`, and several
-others pair styles.  These implicit bonds will not be shown by
-:doc:`dump image <dump_image>` since its mechanism for displaying bonds
-relies on explicit bonds being present in the bond topology.
+information is not taken from the bond topology in a data file but the
+potentials first determine a "bond-order" parameter for pairs of atoms
+and - depending on the value of that parameter - apply forces for bonded
+interactions.  This applies to :doc:`ReaxFF <pair_reaxff>`, :doc:`REBO
+and AIREBO <pair_airebo>`, :doc:`BOP <pair_bop>`, and several others
+pair styles.  These implicit bonds will not be shown by :doc:`dump image
+<dump_image>` since its mechanism for displaying bonds relies on
+explicit bonds being present in the bond topology.
 
 One can hide the fact that there are no bonds by setting the atom radii
 to the covalent radii of the corresponding elements (see leftmost
@@ -501,7 +622,7 @@ currently three approaches to make those bonds visible.
    the computation of the model.  This is currently only available for
    ReaxFF by using :doc:`fix reaxff/bonds <fix_reaxff_bonds>`.
 
-#. Use the *autobonds* keyword of :doc:`dump image <dump_image>` to
+#. Use the *autobond* keyword of :doc:`dump image <dump_image>` to
    approximate the bonds based on a simple distance heuristic.  This is
    similar to the *Dynamic Bonds* representation in `VMD
    <https://www.ks.uiuc.edu/Research/vmd/>`_.  How accurate this option
@@ -516,18 +637,18 @@ currently three approaches to make those bonds visible.
    hydrogen-hydrogen distance for hydrogen atoms bound to the same atom
    (e.g. in water, methane or hydrocarbon chains).
 
-#. Use use a combination of :doc:`fix bond/break <fix_bond_break>`
-   and :doc:`fix bond/create/angle <fix_bond_create>` with :doc:`bond
-   style zero <bond_zero>` to dynamically create and remove bonds that
-   do not add any forces.  This also requires to tell the neighbor list
-   code to not treat any pairs of atoms as special neighbors (otherwise
-   the corresponding pairs of atoms could be excluded from the neighbor
-   list and thus the forces computed by the pair style incorrect)
-   through using the :doc:`special_bonds <special_bonds>` command.
-   Unlike the two other options which were recently added when this
-   document when was written, this method also works with older versions
-   of LAMMPS.  Here is an example of the necessary commands for a carbon
-   nanotube (that is modeled with AIREBO):
+#. Use a combination of :doc:`fix bond/break <fix_bond_break>` and
+   :doc:`fix bond/create/angle <fix_bond_create>` with :doc:`bond style
+   zero <bond_zero>` to dynamically create and remove bonds that do not
+   add any forces.  This also requires to tell the neighbor list code to
+   not treat any pairs of atoms as special neighbors (otherwise the
+   corresponding pairs of atoms could be excluded from the neighbor list
+   and thus the forces computed by the pair style incorrect) through
+   using the :doc:`special_bonds <special_bonds>` command.  Unlike the
+   two other options, which were added more recently, this method also
+   works with older versions of LAMMPS.  Here is an example of the
+   necessary commands for a carbon nanotube modeled with the AIREBO
+   potential:
 
    .. code-block:: LAMMPS
 
@@ -567,7 +688,7 @@ currently three approaches to make those bonds visible.
 .. -------------
 
 Visualizing body particles
---------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Body particles are objects formed from either a collection of spherical
 particles, polygons (in 2d), or polyhedra (in 3d) formed from triangular
@@ -604,12 +725,15 @@ faces (*bflag1* value 1), or both (*bflag1* value 3).
 
 -------------
 
-Visualizing ellipsoid particles
--------------------------------
+Visualizing ellipsoid and superellipsoid particles
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 11Feb2026
 
 Ellipsoidal particles are a generalization of spheres that may have
-three different radii to define the shape.  They can be modeled using
-pair styles :doc:`gayberne <pair_gayberne>` or :doc:`resquared
+three different radii to define the shape.  Superellipsoids are in turn
+a generalization of ellipsoids.  They can be modeled using pair styles
+like :doc:`gayberne <pair_gayberne>` or :doc:`resquared
 <pair_resquared>`.  The regular :doc:`dump custom <dump>` command can
 output the center of those bodies, the shape parameters and the
 orientation as quaternions.  If one follows the required conventions and
@@ -617,52 +741,82 @@ follows the documented steps, those trajectory dump files can be
 `imported and visualized in OVITO
 <https://www.ovito.org/manual/advanced_topics/aspherical_particles.html>`_
 
-As an alternative, the ellipsoid particles can be visualized directly
-with :doc:`dump image <dump_image>` using the *ellipsoid* keyword.  The
-color and transparency settings can be changed by settings those
-properties for the corresponding atom types.  It is also possible to
-represent the ellipsoids via generating a triangle mesh and visualizing
-it as either wireframes (*eflag* value 2), planar faces (*eflag* value
-1), or both (*eflag* value 3), same as demonstrated for body particles
-above.  The use of a triangle mesh is currently required since the
-rasterizer built into LAMMPS does not offer a suitable graphics
-primitive for ellipsoids.  The mesh is constructed by iteratively
-refining a triangle mesh representing an octahedron where each triangle
-is replaced by four triangles.  For a smooth representation a refinement
-level of 5 or 6 is required, which will cause a significant slowdown of
-the rendering of the image.  Also, some artifacts can happen due to
-rounding which can be somewhat minimized using FSAA (which causes
-further slowdown of the rendering).
+.. versionchanged:: 30Mar2026
 
-.. |ellipsoid1| image:: img/ellipsoid-level2.png
-   :width: 33%
-.. |ellipsoid2| image:: img/ellipsoid-level4.png
-   :width: 33%
-.. |ellipsoid3| image:: img/ellipsoid-level6.png
-   :width: 33%
+   Now uses curved triangles instead of flat ones; "both" option is removed; support for superellipsoids was added
 
-|ellipsoid1|  |ellipsoid2|  |ellipsoid3|
+As an alternative, the ellipsoid and superellipsoid particles can be
+visualized directly with :doc:`dump image <dump_image>` using the
+*ellipsoid* keyword.  The color and transparency settings can be changed
+by setting those properties for the corresponding atom types.  It is
+also possible to represent the ellipsoids via generating a triangle mesh
+and visualizing it as either wireframes (*eflag* value 2) or rounded
+triangle faces (*eflag* value 1).  The use of a triangle mesh is
+currently required since the rasterizer built into LAMMPS does not offer
+suitable graphics primitives for ellipsoids or superellipsoids.  The
+mesh is constructed by iteratively refining a triangle mesh representing
+an icosahedron, where each triangle is replaced by four triangles in
+each iteration.  For a smooth representation a refinement level of 4
+seems sufficient, but high resolution images may benefit from a higher
+level (maximum is 6, see example images below).  A high refinement level
+can cause a significant slowdown of the rendering of the image due to
+the large number of triangles that need to be computed and drawn.  This
+slowdown will be more pronounced when enabling FSAA or SSAO or both.
+
+.. |ellipsoid1| image:: img/ellipsoid-mesh.png
+   :width: 24%
+.. |ellipsoid2| image:: img/ellipsoid-level2.png
+   :width: 24%
+.. |ellipsoid3| image:: img/ellipsoid-level4.png
+   :width: 24%
+.. |ellipsoid4| image:: img/ellipsoid-level6.png
+   :width: 24%
+
+|ellipsoid1|  |ellipsoid2|  |ellipsoid3|  |ellipsoid4|
 
 .. raw:: html
 
-   <center>(Ellipsoid particle visualization examples for different mesh refinement levels.
-   left: level 2, center: level 4, right: level 6. Click to see the full-size images)</center><br>
+   <center>(Ellipsoid particle visualization examples for different mesh
+         levels.  from left to right: wireframe level 3, triangles level
+         2, triangles level 4, triangles level 6. Click to see the
+         full-size images)</center><br>
 
 These images were created by adding the following :doc:`dump image and dump_modify <dump_image>`
 commands to the ``in.ellipse.resquared`` input example:
 
 .. code-block:: LAMMPS
 
-   #                                                       change + this
-   dump viz all image 1000 image-*.png type type ellipsoid type 3 4 0.05 &
-         size 600 600 zoom 2.2 shiny 0.1 fsaa yes view 80 -10 box yes 0.025 &
-         axes no 0.0 0.0 center s 0.5 0.5 0.5 ssao yes 32185474 0.6
-   dump_modify viz pad 9 boxcolor white backcolor gray adiam 1 4 adiam 2 7
+   #                                                   change /V\ this
+   dump viz all image 1000 image-*.png x type ellipsoid atom 1 4 0.2 &
+        size 600 600 zoom 1.331 view 80 20 box yes 0.025 shiny 0.2 fsaa yes
+   dump_modify viz pad 6 boxcolor goldenrod backcolor black backcolor2 white &
+        color map1 0.459 0.055 0.075 color map2 0.000 0.227 0.427 &
+        amap min max cf 0.0 5 min map1 0.1 map1 0.5 white 0.9 map2 max map2
+
+.. versionadded:: 30Mar2026
+
+The visualization of superellipsoids works exactly the same way as for
+ellipsoids by creating a triangle mesh of an icosahedron and refining
+and deforming it.  The difference is merely internally the applied
+deformation function and the corresponding computation of the surface
+normals.  LAMMPS will auto-detect which function to use.  Some
+visualizations of the ``in.drop_test``, the ``in.bowling``, and the
+``in.super_table`` examples from the
+``examples/ASPHERE/superellipsoid_gran`` folder are shown below.
+
+.. |superellipsoid1| image:: img/superellipsoids-drop.png
+   :width: 23%
+.. |superellipsoid2| image:: img/superellipsoids-bowl.png
+   :width: 41%
+.. |superellipsoid3| image:: img/superellipsoids-zoo.png
+   :width: 31%
+
+|superellipsoid1|  |superellipsoid2|  |superellipsoid3|
 
 -------------
 
 Visualizing regions
--------------------
+^^^^^^^^^^^^^^^^^^^
 
 Since there are several commands that operate on atoms within a specific
 :doc:`region <region>` , it can be helpful to visualize the extent of
@@ -759,7 +913,7 @@ Below is an example input deck for visualizing *cone* and *cylinder* regions:
 -----------------------
 
 Visualizing graphics provided by compute or fix commands
---------------------------------------------------------
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 LAMMPS can display additional graphics objects in the :doc:`dump image
 <dump_image>` output that are added by compute or fix styles.  These
@@ -778,13 +932,17 @@ and fix styles:
 .. table_from_list::
    :columns: 4
 
+   * :doc:`compute chunk/atom <compute_chunk_atom>`
+   * :doc:`compute frenkel <compute_frenkel>`
    * :doc:`compute hbond/local <compute_hbond_local>`
    * :doc:`fix graphics/arrows <fix_graphics_arrows>`
+   * :doc:`fix graphics/chunk <fix_graphics_chunk>`
    * :doc:`fix graphics/isosurface <fix_graphics_isosurface>`
    * :doc:`fix graphics/labels <fix_graphics_labels>`
    * :doc:`fix graphics/lines <fix_graphics_lines>`
    * :doc:`fix graphics/objects <fix_graphics_objects>`
    * :doc:`fix graphics/periodic <fix_graphics_periodic>`
+   * :doc:`fix graphics/replica <fix_graphics_replica>`
    * :doc:`fix atom/swap <fix_atom_swap>`
    * :doc:`fix bond/break <fix_bond_break>`
    * :doc:`fix bond/create <fix_bond_create>`
@@ -795,6 +953,7 @@ and fix styles:
    * :doc:`fix indent <fix_indent>`
    * :doc:`fix reaxff/bonds <fix_reaxff_bonds>`
    * :doc:`fix smd/wall_surface <fix_smd_wall_surface>`
+   * :doc:`fix surface/global <fix_surface_global>`
    * :doc:`fix wall/body/polygon <fix_wall_body_polygon>`
    * :doc:`fix wall/body/polyhedron <fix_wall_body_polyhedron>`
    * :doc:`fix wall/ees <fix_wall_ees>`
@@ -839,7 +998,7 @@ Below are discussions about some aspects of specific fix commands and some input
 -----------------------
 
 Fix graphics/objects
-^^^^^^^^^^^^^^^^^^^^
+""""""""""""""""""""
 
 Fix :doc:`graphics/objects <fix_graphics_objects>` adds some graphics
 primitives and more complex objects like a progress bar to the
@@ -847,7 +1006,7 @@ visualization where properties of the object(s) are controlled by
 :doc:`equal-style or compatible variables <variable>`.
 
 Fix graphics/labels
-^^^^^^^^^^^^^^^^^^^
+"""""""""""""""""""
 
 Fix :doc:`graphics/labels <fix_graphics_labels>` adds graphics from
 pixmaps to the visualization.  These can be either images or text that
@@ -872,7 +1031,7 @@ obscured by objects.
 -----------------------
 
 Fix graphics/arrows
-^^^^^^^^^^^^^^^^^^^
+"""""""""""""""""""
 
 Fix :doc:`graphics/arrows <fix_graphics_arrows>` adds per-atom or
 per-chunk arrows to the visualization.  The arrows represent some
@@ -910,14 +1069,14 @@ velocities:
    fix dipole all graphics/objects 1 arrow 1  v_dip1x v_dip1y v_dip1z v_dip2x v_dip2y v_dip2z 0.3 0.2
 
    dump viz all image 100 image-*.png element type size 600 600 zoom 1.3 view 70 20 shiny 0.1 &
-                bond atom 0.2box yes 0.025 axes no 0.0 0.0 center s 0.5 0.5 0.5 fsaa yes &
+                bond atom 0.2 box yes 0.025 axes no 0.0 0.0 center s 0.5 0.5 0.5 fsaa yes &
                 fix dipole const 0 0 fix vec const 0 0 fix vel const 0 0 ssao yes 315465 0.8
    dump_modify viz pad 6 boxcolor white backcolor gray element O H  bdiam 1 0.2 &
                 adiam 1 0.5 adiam 2 0.3 acolor 1 silver acolor 2 red fcolor vec goldenrod &
                 fcolor dipole forestgreen ftrans dipole 0.75 fcolor vel cyan ftrans vel 0.5
 
 Fix graphics/isosurface
-^^^^^^^^^^^^^^^^^^^^^^^
+"""""""""""""""""""""""
 
 Fix :doc:`graphics/isosurface <fix_graphics_isosurface>` adds a
 triangulated surface following a given isovalue through a 3d-grid of
@@ -950,14 +1109,9 @@ and a transparent white triangle surface to represent those molecules.
           fcolor membrane darkgreen ftrans membrane 1.0 ftrans water 0.5 &
           element H H H H H H H H H C C C C C C C C C C C C C N N N N N N N O O O O S S &
                   H H H H H C C C C C C N O O O P Cl Na H H H N C C C C C C C C C C C &
-          adiam 1 1.92 adiam 2 1.92 adiam 3 1.92 adiam 5 1.92 adiam 6 1.92 adiam 7 1.92 adiam 8 1.92 &
-          adiam 9 1.92 adiam 10 2.72 adiam 11 2.72 adiam 12 2.72 adiam 13 2.72 adiam 14 2.72 &
-          adiam 15 2.72 adiam 16 2.72 adiam 17 2.72 adiam 18 2.72 adiam 19 2.72 adiam 20 2.72 &
-          adiam 21 2.72 adiam 22 2.72 adiam 23 2.48 adiam 24 2.48 adiam 25 2.48 adiam 26 2.48 &
-          adiam 27 2.48 adiam 28 2.48 adiam 29 2.48 adiam 30 2.432 adiam 31 2.432 adiam 32 2.432 &
-          adiam 34 2.88 adiam 35 2.88 adiam 52 3.632 adiam 53 2.176 adiam 54 1.92 adiam 55 1.92 &
-          adiam 56 1.92 adiam 57 2.48 adiam 58 2.72 adiam 59 2.72 adiam 60 2.72 adiam 61 2.72 &
-          adiam 62 2.72 adiam 63 2.72 adiam 64 2.72 adiam 65 2.72 adiam 66 2.72 adiam 67 2.72 adiam 68 2.72
+          adiam 1*9 1.92 adiam 10*22 2.72 adiam 23*29 2.48 adiam 30*33 2.432 adiam 34*35 2.88 &
+          adiam 36*40 1.92 adiam 41*46 2.72 adiam 47 2.48 adiam 48*50 2.432 adiam 51 2.88 &
+          adiam 52 3.632 adiam 53 2.176 adiam 54*56 1.92 adiam 57 2.48 adiam 58*68 2.72
 
 .. |isosurface1| image:: img/rhodo-all.png
    :width: 49%
@@ -973,7 +1127,7 @@ and a transparent white triangle surface to represent those molecules.
 ----------
 
 Compute hbond/local
-^^^^^^^^^^^^^^^^^^^
+"""""""""""""""""""
 
 Compute :doc:`hbond/local <compute_hbond_local>` of the
 :ref:`EXTRA-COMPUTE package <pkg-extra-compute>` provides access to the
@@ -995,7 +1149,7 @@ input file:
 
    group       ogroup type 1
    group       hgroup type 2
-   compute     hb     all hbond/local 3.3 30.0 ogroup ogroup hgroup
+   compute     hb     all hbond/local 3.5 30.0 ogroup ogroup hgroup
 
    dump        viz    all image 100 water-*.png element type size 600 600 zoom 1.331 view 70 20 &
                                                 shiny 0.2 ssao yes 348276 0.6 fsaa yes  box yes 0.025 &
@@ -1017,25 +1171,19 @@ and the surrounding water molecules in both directions.
 
 .. code-block:: LAMMPS
 
-    # define ellipsoid region around peptide for hbond analysis and visualization
-    group     peptide type <= 12
-    variable  comx equal xcm(peptide,x)
-    variable  comy equal xcm(peptide,y)
-    variable  comz equal xcm(peptide,z)
-    region    shell ellipsoid v_comx v_comy v_comz 7.0 8.0 16.0
-    group     viz dynamic all region shell include molecule
+    # select atoms for visualization: peptide and water molecules within 3.5 angstrom
+    group     viz dynamic peptide within 3.5 include molecule every 100
 
-    # define groups of donor and acceptor atoms for peptide and water
-    group           pdonor    type 5
-    group           wdonor    type 13
-    group           pacceptor type 3 5 9 12
-    group           wacceptor type 13
-    group           hydrogen type 10 14
+    # define groups of donor, acceptor, and hydrogen atoms for peptide and water
+    group           pdonor    type  5  9        # peptide donors : nitrogens and phenol oxygen
+    group           woxygen   type 13           # water oxygens are donor and acceptor
+    group           pacceptor type  3  5  9 12  # peptide acceptors: oxygens, nitrogens, and sulfur
+    group           hydrogen  type  4 10 14     # hydrogens bonded to oxygens and nitrogens
 
     # peptide-water hydrogen bonds where the peptide is the donor
-    compute hb1 all hbond/local 3.3 30.0 pdonor wacceptor hydrogen
+    compute hb1 all hbond/local 3.5 30.0 pdonor woxygen hydrogen
     # peptide-water hydrogen bonds where the peptide is the acceptor
-    compute hb2 all hbond/local 3.7 30.0 wdonor pacceptor hydrogen
+    compute hb2 all hbond/local 3.7 30.0 woxygen pacceptor hydrogen
 
     # create donor/acceptor hydrogen bond info text
     fix label all graphics/labels 100 text "Hydrogen bonds donated:   $(c_hb1:%02.0f)" 207 72 0.0 &
@@ -1067,7 +1215,7 @@ and the surrounding water molecules in both directions.
 ----------
 
 Fix reaxff/bonds
-^^^^^^^^^^^^^^^^
+""""""""""""""""
 
 Fix :doc:`reaxff/bonds <fix_reaxff_bonds>` of the :ref:`REAXFF package
 <pkg-reaxff>` provides access to the list of bonds as they are
@@ -1076,14 +1224,14 @@ discussed above, this can be used to visualize bonds for a system where
 there is no explicit bond topology defined.
 
 Fix smd/wall_surface
-^^^^^^^^^^^^^^^^^^^^
+""""""""""""""""""""
 
 Fix :doc:`smd/wall_surface <fix_smd_wall_surface>` of the :ref:`MACHDYN
 package <pkg-machdyn>` creates a custom wall from a mesh of triangles
 that is read from an STL format file.
 
 MC package fixes
-^^^^^^^^^^^^^^^^
+""""""""""""""""
 
 Several fixes from the :ref:`MC package <pkg-mc>` have support for
 adding graphics to a visualization.  These are typically added spheres

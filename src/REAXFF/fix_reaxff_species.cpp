@@ -44,7 +44,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <exception>
 #include <random>
 
 using namespace LAMMPS_NS;
@@ -137,7 +136,9 @@ FixReaxFFSpecies::FixReaxFFSpecies(LAMMPS *lmp, int narg, char **arg) :
     if (platform::has_compress_extension(arg[6])) {
       fp = platform::compressed_write(arg[6]);
       compressed = 1;
-      if (!fp) error->one(FLERR, 6, "Cannot open compressed file");
+      if (!fp)
+        error->one(FLERR, 6, "Cannot open compressed file {}: {}", arg[6],
+                   platform::compressed_open_error(arg[6]));
     } else
       fp = fopen(arg[6], "w");
 
@@ -294,12 +295,14 @@ FixReaxFFSpecies::FixReaxFFSpecies(LAMMPS *lmp, int narg, char **arg) :
         error->all(FLERR, iarg + 1, "Incompatible fix reaxff/species position frequency {}",
                    posfreq);
 
+      delete[] filepos;
       filepos = new char[255];
       strcpy(filepos, arg[iarg + 2]);
       if (strchr(filepos, '*')) {
         multipos = 1;
       } else {
         if (comm->me == 0) {
+          if (pos) fclose(pos);
           pos = fopen(filepos, "w");
           if (pos == nullptr)
             error->one(FLERR, iarg + 2, "Cannot open fix reaxff/species position file: {}",
@@ -355,12 +358,14 @@ FixReaxFFSpecies::~FixReaxFFSpecies()
     if (fdel) fclose(fdel);
   }
 
-  try {
-    modify->delete_compute(fmt::format("SPECATOM_{}", id));
-    modify->delete_fix(fmt::format("SPECBOND_{}", id));
-    modify->delete_fix(fmt::format("clusterID_{}", id));
-  } catch (std::exception &) {
-  }
+  // the compute and fixes are created in init(), so they do not exist without a run
+
+  const auto id_specatom = fmt::format("SPECATOM_{}", id);
+  if (modify->get_compute_by_id(id_specatom)) modify->delete_compute(id_specatom);
+  const auto id_specbond = fmt::format("SPECBOND_{}", id);
+  if (modify->get_fix_by_id(id_specbond)) modify->delete_fix(id_specbond);
+  const auto id_cluster = fmt::format("clusterID_{}", id);
+  if (modify->get_fix_by_id(id_cluster)) modify->delete_fix(id_cluster);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -506,7 +511,7 @@ void FixReaxFFSpecies::Output_ReaxFF_Bonds(bigint ntimestep, FILE * /*fp*/)
 
   if (comm->me == 0 && ntimestep >= 0) WriteFormulas(Nmole, Nspec);
 
-  if (posflag && ((ntimestep) % posfreq == 0)) {
+  if (posflag && (ntimestep % posfreq == 0)) {
     WritePos(Nmole, Nspec);
     if (comm->me == 0) fflush(pos);
   }

@@ -31,8 +31,9 @@ Create a small test system
 Debugging problems often requires running a simulation many times with
 small modifications, thus it can be a huge time saver to first assemble
 a small test system input that has the same issue, but will take much
-time until it triggers the error condition.  Also, it will be easier to
-see what happens.
+less time until it triggers the error condition.  Also, it will be
+easier to see what happens when visualizing the system or looking at
+output files.
 
 .. _hint02:
 
@@ -81,15 +82,15 @@ While a segmentation fault is likely an indication of a bug in LAMMPS,
 it need not always be; it can also be the consequence of too aggressive
 simulation settings.  For time critical code paths, LAMMPS will assume
 the user has chosen the settings carefully and will not make any checks
-to avoid to avoid performance penalties.
+to avoid performance penalties.
 
 A crucial step in resolving a segmentation fault is to identify the
-exact location in the code where it happens.  Please see `Errors_debug`
-for a couple of examples showing how to do this on a Linux machine.
-With this information -- a simple way to reproduce the segmentation
-fault and the exact :doc:`LAMMPS version <Manual_version>` and platform
-you are running on -- you can contact the LAMMPS developers or post in
-the LAMMPS forum to get assistance.
+exact location in the code where it happens.  Please see
+:doc:`Errors_debug` for a couple of examples showing how to do this on a
+Linux machine.  With this information -- a simple way to reproduce the
+segmentation fault and the exact :doc:`LAMMPS version <Manual_version>`
+and platform you are running on -- you can contact the LAMMPS developers
+or post in the LAMMPS forum to get assistance.
 
 .. _hint05:
 
@@ -100,7 +101,7 @@ Fast moving atoms may be "lost" or "missing" when their velocity becomes
 so large that they can cross a sub-domain within one timestep.  This
 often happens when atoms are too close, but atoms may also "move" too
 fast from sub-domain to sub-domain if the box changes rapidly.
-E.g. when setting a large an initial box with :doc:`shrink-wrap boundary
+E.g. when setting a large initial box with :doc:`shrink-wrap boundary
 conditions <boundary>` that collapses on the first step (in this case
 the solution is often using 'm' instead of 's' as a boundary condition).
 
@@ -142,11 +143,24 @@ contacts or bad geometries (for the given force styles in use) leading
 to forces that can no longer be represented as numbers.  Those will show
 as "NaN" or "Inf".  On most machines, the program will continue, but
 there is no way to recover from it and those NaN or Inf values will
-propagate.  So-called :doc:`"soft-core" potentials <pair_fep_soft>` or
-the :doc:`"soft" repulsive-only pair style <pair_soft>` are less prone
-for this behavior (depending on the settings in use) and can be used at
-the beginning of a simulation.  Also, single precision numbers can
-overflow much faster, so for the GPU, KOKKOS, or INTEL package it may be
+propagate.
+
+If the "NaN" or "Inf" appears in the first simulation step, the most
+common cause is overlapping atoms.  Note that when atoms are *very*
+close, this cannot be seen when visualizing the geometry, since the
+atoms are effectively sitting on top of each other.  A good test is to
+insert a command like :doc:`delete_atoms 0.1 all all <delete_atoms>` and
+then monitor the output to see how many atoms are deleted, if any.  A
+non-zero number would be an indication of overlapping atoms. Note that
+atoms can also overlap through periodic boundaries when the box
+dimensions are too small (e.g. determined by min/max position of atoms
+without padding).
+
+So-called :doc:`"soft-core" potentials <pair_fep_soft>` or the
+:doc:`"soft" repulsive-only pair style <pair_soft>` are less prone for
+this behavior (depending on the settings in use) and can be used at the
+beginning of a simulation.  Also, single precision numbers can overflow
+much faster, so for the GPU, KOKKOS, or INTEL package it may be
 beneficial to run with double precision initially before switching to
 mixed or single precision for faster execution when the system has
 relaxed.
@@ -253,7 +267,7 @@ before the box (e.g. a compute or fix reference or a thermo keyword).
 Illegal ... command
 ^^^^^^^^^^^^^^^^^^^
 
-These are a catchall error messages that used to be used a lot in LAMMPS
+These are catchall error messages that used to be used a *lot* in LAMMPS
 (also programmers are sometimes lazy).  They usually include the name of
 the source file and the line where the error happened.  This can be used
 to track down what caused the error (most often some form of syntax error)
@@ -420,7 +434,7 @@ Nose-Hoover (or other) barostat, and thus it may be advisable to run
 with only a thermostat for a bit until the potential energy has
 stabilized.
 
-.. _err007:
+.. _err0007:
 
 Fix used in ... not computed at compatible time
 -----------------------------------------------
@@ -467,8 +481,13 @@ can occur when some atoms move rapidly apart with shrink-wrap boundaries
 or when a fix (like fix deform or a barostat) excessively grows the
 simulation box.  This can also happen if the largest pair-wise cutoff is
 small.  In this case, the error can be avoided by using the
-:doc:`neigh_modify command <neigh_modify>` to set the bin width to a
-suitably large value.
+:doc:`neigh_modify command <neigh_modify>` to either (a) set the bin width
+to a suitably large value or (b) use a hash table to store the bins for
+each atom. The latter option currently only supports the
+:doc:`multi <neighbor>` neighbor style and is intended for systems where
+there is a low particle density and a small cutoff. Namely, systems with
+very large ratios of minimum to maximum particle sizes/cutoffs. This may
+require adjustment of :doc:`atom sort settings <atom_modify>`.
 
 .. _err0010:
 
@@ -508,7 +527,7 @@ executable.  In rare cases, there may be licensing or portability issues
 that prevent including a package in publicly accessible binaries or in a
 specific environment.
 
-.. _err011:
+.. _err0011:
 
 Energy or stress was not tallied by pair style
 ----------------------------------------------
@@ -557,7 +576,7 @@ For example:
    variable cutoff index 10.0
    pair_style lj/cut ${cutoff}  # this is correct
    pair_style lj/cut $cutoff    # this is incorrect, LAMMPS looks for 'c' instead of 'cutoff'
-   variable c      index 5.0    # if $c is defined, LAMMPS subsitutes only '$c' and reads: 5utoff
+   variable c      index 5.0    # if $c is defined, LAMMPS substitutes only '$c' and reads: 5utoff
 
 Another potential source of this error may be invalid command line
 variables (-var or -v argument) used when launching LAMMPS from an
@@ -895,7 +914,7 @@ the lack of a time-integrating fix is intentional or not.
 System is not charge neutral, net charge = ...
 ----------------------------------------------
 
-the sum of charges in the system is not zero.  When a system is not
+The sum of charges in the system is not zero.  When a system is not
 charge-neutral, methods that evolve/manipulate per-atom charges,
 evaluate Coulomb interactions, evaluate Coulomb forces, or
 evaluate/manipulate other properties relying on per-atom charges may
@@ -1008,7 +1027,7 @@ Error messages ending in 'Please contact the LAMMPS developers'
 Such error messages indicate that something unexpected has happened and
 that it will require a good understanding of the details of the design
 of LAMMPS to resolve this.  This can be due to some bug in contributed
-code, and oversight when updating functionality, a feature that is
+code, an oversight when updating functionality, a feature that is
 scheduled to be removed or reaching a combination of flags and settings
 that should not be possible or similar.
 
@@ -1117,3 +1136,71 @@ desired and changes are made and commands renamed or removed.  In that
 case an error message is printed describing why the command cannot be
 executed.  More details can be found on the manual page
 :doc:`Commands_removed`.
+
+.. _err0039:
+
+Cached download settings differ from the current defaults
+---------------------------------------------------------
+
+Several optional packages and tools in LAMMPS depend on external
+libraries that CMake can download and compile automatically, for example
+when configuring with ``-D PKG_MBX=on`` or ``-D DOWNLOAD_KOKKOS=on``.
+The URL of the archive to download and its SHA-256 checksum are stored
+in the CMake cache of the build folder as variables ``<NAME>_URL`` and
+``<NAME>_SHA256`` (e.g. ``KOKKOS_URL`` and ``KOKKOS_SHA256``).  This
+makes it possible to permanently override the defaults for a build
+folder, e.g. to use a local copy of the archive on machines without
+internet access, or to test a different version of the library.
+
+The downside of this is that CMake keeps the cached settings when the
+LAMMPS sources used with a build folder are updated to a newer version
+that requires a different version of the external library.  LAMMPS thus
+also records the default checksum in the cache and updates the cached
+settings automatically when they are unchanged from the previous
+defaults.  When that is not possible, because the settings have been
+customized or because the build folder was last configured with an older
+LAMMPS version that did not record the default, this warning is printed
+instead.  It shows the cached settings and the current default URL.
+
+If the different settings are intentional, the warning can be ignored.
+Otherwise the cached settings should be reset to the current defaults by
+removing them from the CMake cache when re-running CMake, e.g. with:
+
+.. code-block:: bash
+
+   cmake -U KOKKOS_URL -U KOKKOS_SHA256 build
+
+Alternatively, the variables can be set explicitly with ``-D`` to the
+desired values, or a new build folder can be used.
+
+.. _err0040:
+
+LAMMPS is run with superuser or administrator privileges
+--------------------------------------------------------
+
+The LAMMPS executable prints this warning when it is started from the
+"root" account on Linux or macOS (this includes using ``sudo``), or with
+"Run as administrator" on Windows.  LAMMPS does not need such privileges
+for anything, and running it that way is strongly discouraged.
+
+A LAMMPS input can read, change, and delete files, run other programs,
+and access the network (see :doc:`Build_security`).  For a regular user
+the damage from a mistake in an input file, from a bug in LAMMPS or in
+one of the libraries it uses, or from an input file with malicious
+content is limited to what that user is allowed to access.  With
+superuser or administrator privileges it can affect the entire machine,
+including the operating system and the files of all other users.
+
+To avoid the warning, run LAMMPS from a regular user account.  The same
+applies to compiling and installing LAMMPS: by default, LAMMPS is
+installed into a folder inside the home directory of the user, so that
+no special privileges are needed, and CMake prints a similar warning
+when it is run as superuser.  Programs in containers often run as "root"
+by default.  In that case it is recommended to create a regular user
+account inside the container, or to tell the container software to run
+as a regular user, for example with the ``--user`` flag of ``docker
+run``.
+
+LAMMPS continues after printing the warning.  The warning is only
+printed by the LAMMPS executable and not when LAMMPS is used as a
+library from another program or through the LAMMPS Python module.

@@ -114,8 +114,8 @@ FixCMAP::FixCMAP(LAMMPS *lmp, int narg, char **arg) :
 
   nmax_previous = 0;
   FixCMAP::grow_arrays(atom->nmax);
-  atom->add_callback(Atom::GROW);
-  atom->add_callback(Atom::RESTART);
+  atom->add_callback(this, Atom::GROW);
+  atom->add_callback(this, Atom::RESTART);
 
   // local list of crossterms
 
@@ -133,8 +133,8 @@ FixCMAP::~FixCMAP()
 
   // unregister callbacks to this fix from Atom class
 
-  atom->delete_callback(id,Atom::GROW);
-  atom->delete_callback(id,Atom::RESTART);
+  atom->delete_callback(this, Atom::GROW);
+  atom->delete_callback(this, Atom::RESTART);
 
   memory->destroy(g_axis);
   memory->destroy(cmapgrid);
@@ -759,7 +759,7 @@ void FixCMAP::set_map_derivatives(double **map, double **d1yo, double **d2yo,
       psi = (j-xm)*CMAPDX-180.0;
       ix = int((psi-CMAPXMIN)/CMAPDX);
       a = (CMAPXMIN+((ix+1)*1.0)*CMAPDX-psi)/CMAPDX;
-      b = (psi-CMAPXMIN-((ix)*1.0)*CMAPDX)/CMAPDX;
+      b = (psi-CMAPXMIN-(ix*1.0)*CMAPDX)/CMAPDX;
       a1 = a*a*a-a;
       b1 = b*b*b-b;
       a2 = 3.0*a*a-1.0;
@@ -953,7 +953,7 @@ void FixCMAP::read_data_section(char * /*keyword*/, int /*n*/, char *buf,
   tagint atom1,atom2,atom3,atom4,atom5;
 
   auto lines = utils::split_lines(buf);
-  if (lines.size() == 0) return;
+  if (lines.empty()) return;
 
   // loop over lines of CMAP crossterms
   // tokenize the line into values

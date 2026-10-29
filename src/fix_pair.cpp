@@ -38,7 +38,7 @@ FixPair::FixPair(LAMMPS *lmp, int narg, char **arg) :
   if (nevery < 1) error->all(FLERR,"Illegal fix pair every value: {}", nevery);
 
   pairname = utils::strdup(arg[4]);
-  query_pstyle(lmp);
+  query_pstyle();
   if (pstyle == nullptr) error->all(FLERR,"Pair style {} for fix pair not found", pairname);
 
   nfield = (narg-5) / 2;
@@ -112,7 +112,7 @@ FixPair::FixPair(LAMMPS *lmp, int narg, char **arg) :
   vector = nullptr;
   array = nullptr;
   FixPair::grow_arrays(atom->nmax);
-  atom->add_callback(Atom::GROW);
+  atom->add_callback(this, Atom::GROW);
 
   // zero the vector/array since dump may access it on timestep 0
   // zero the vector/array since a variable may access it before first ru
@@ -134,23 +134,25 @@ FixPair::FixPair(LAMMPS *lmp, int narg, char **arg) :
 
 /* ---------------------------------------------------------------------- */
 
-void FixPair::query_pstyle(LAMMPS *lmp) {
-    char *cptr=nullptr;
-    int nsub = 0;
-    if ((cptr = strchr(pairname, ':'))) {
-        *cptr = '\0';
-        nsub = utils::inumeric(FLERR,cptr+1,false,lmp);
+void FixPair::query_pstyle() {
+  char *paircopy = utils::strdup(pairname);
+  char *cptr=nullptr;
+  int nsub = 0;
+  if ((cptr = strchr(paircopy, ':'))) {
+    *cptr = '\0';
+    nsub = utils::inumeric(FLERR,cptr+1,false,lmp);
+  }
+  pstyle = nullptr;
+  if (lmp->suffix_enable) {
+    if (lmp->suffix) {
+      pstyle = force->pair_match(fmt::format("{}/{}", paircopy, lmp->suffix), 1, nsub);
+      if (pstyle == nullptr && (lmp->suffix2)) {
+        pstyle = force->pair_match(fmt::format("{}/{}", paircopy, lmp->suffix2), 1, nsub);
+      }
     }
-    pstyle = nullptr;
-    if (lmp->suffix_enable) {
-        if (lmp->suffix) {
-            pstyle = force->pair_match(fmt::format("{}/{}", pairname, lmp->suffix), 1, nsub);
-            if (pstyle == nullptr && (lmp->suffix2)) {
-                pstyle = force->pair_match(fmt::format("{}/{}", pairname, lmp->suffix2), 1, nsub);
-            }
-        }
-    }
-    if (pstyle == nullptr) pstyle = force->pair_match(pairname, 1, nsub);
+  }
+  if (pstyle == nullptr) pstyle = force->pair_match(paircopy, 1, nsub);
+  delete[] paircopy;
 }
 
 
@@ -160,7 +162,7 @@ FixPair::~FixPair()
 {
   // unregister callbacks to this fix from Atom class
 
-  atom->delete_callback(id,Atom::GROW);
+  atom->delete_callback(this, Atom::GROW);
 
   delete[] pairname;
   for (int ifield = 0; ifield < nfield; ifield++) {
@@ -194,8 +196,7 @@ int FixPair::setmask()
 void FixPair::init()
 {
   // ensure pair style still exists
-
-  query_pstyle(lmp);
+  query_pstyle();
   if (pstyle == nullptr) error->all(FLERR,"Pair style {} for fix pair not found", pairname);
 }
 

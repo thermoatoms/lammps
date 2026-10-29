@@ -186,12 +186,15 @@ FixNeighborSwap::~FixNeighborSwap()
 }
 
 // helper function: detect known keywords
-static const std::unordered_set<std::string> known_keywords = {"region", "ke", "types", "diff",
-                                                               "rates"};
-static bool is_keyword(const std::string &arg)
+namespace {
+// NOLINTNEXTLINE
+const std::unordered_set<std::string> known_keywords = {"region", "ke", "types", "diff", "rates"};
+
+bool is_keyword(const std::string &arg)
 {
   return known_keywords.find(arg) != known_keywords.end();
 }
+}    // namespace
 
 /* ----------------------------------------------------------------------
    parse optional parameters at end of input line
@@ -277,7 +280,7 @@ void FixNeighborSwap::options(int narg, char **arg)
 
 int FixNeighborSwap::modify_param(int narg, char **arg)
 {
-  if (strcmp(arg[0],"vizsteps") == 0) {
+  if (strcmp(arg[0], "vizsteps") == 0) {
     if (narg < 2) utils::missing_cmd_args(FLERR, "fix_modify neighbor/swap", error);
     vizsteps = utils::inumeric(FLERR, arg[1], false, lmp);
     return 2;
@@ -428,25 +431,6 @@ void FixNeighborSwap::init()
       for (int ktype = 1; ktype <= atom->ntypes; ktype++)
         if (cutsq[type_list[iswaptype]][ktype] != cutsq[type_list[jswaptype]][ktype])
           unequal_cutoffs = true;
-
-  // check that no swappable atoms are in atom->firstgroup
-  // swapping such an atom might not leave firstgroup atoms first
-
-  if (atom->firstgroup >= 0) {
-    int *mask = atom->mask;
-    int firstgroupbit = group->bitmask[atom->firstgroup];
-
-    int flag = 0;
-    for (int i = 0; i < atom->nlocal; i++)
-      if ((mask[i] == groupbit) && (mask[i] && firstgroupbit)) flag = 1;
-
-    int flagall;
-    MPI_Allreduce(&flag, &flagall, 1, MPI_INT, MPI_SUM, world);
-
-    if (flagall)
-      error->all(FLERR, Error::NOLASTLINE,
-                 "Cannot do neighbor/swap on atoms in atom_modify first group");
-  }
 }
 
 /* ----------------------------------------------------------------------
@@ -466,7 +450,7 @@ void FixNeighborSwap::pre_exchange()
   comm->exchange();
   comm->borders();
   if (domain->triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
-  if (modify->n_pre_neighbor) modify->pre_neighbor();
+  if (modify->has_fixes(FixConst::PRE_NEIGHBOR)) modify->pre_neighbor();
   neighbor->build(1);
 
   // energy_stored = energy of current state
@@ -535,8 +519,8 @@ int FixNeighborSwap::attempt_swap()
   if (itype == jtype) {
     // record atoms for which the type was swapped and store the old types
     if (vizsteps > 0) {
-      vizatoms[atom->tag[i]] = std::make_pair(vizsteps, jtype);
-      vizatoms[atom->tag[j]] = std::make_pair(vizsteps, itype);
+      if (i >= 0) vizatoms[atom->tag[i]] = std::make_pair(vizsteps, jtype);
+      if (j >= 0) vizatoms[atom->tag[j]] = std::make_pair(vizsteps, itype);
     }
     return 1;
   }
@@ -571,7 +555,7 @@ int FixNeighborSwap::attempt_swap()
     comm->exchange();
     comm->borders();
     if (domain->triclinic) domain->lamda2x(atom->nlocal + atom->nghost);
-    if (modify->n_pre_neighbor) modify->pre_neighbor();
+    if (modify->has_fixes(FixConst::PRE_NEIGHBOR)) modify->pre_neighbor();
     neighbor->build(1);
   } else {
     comm->forward_comm(this);
@@ -601,8 +585,8 @@ int FixNeighborSwap::attempt_swap()
     energy_stored = energy_after;
     // record atoms for which the type was swapped and store the old types
     if (vizsteps > 0) {
-      vizatoms[atom->tag[i]] = std::make_pair(vizsteps, itype);
-      vizatoms[atom->tag[j]] = std::make_pair(vizsteps, jtype);
+      if (i >= 0) vizatoms[atom->tag[i]] = std::make_pair(vizsteps, itype);
+      if (j >= 0) vizatoms[atom->tag[j]] = std::make_pair(vizsteps, jtype);
     }
     return 1;
   }
@@ -632,10 +616,11 @@ int FixNeighborSwap::attempt_swap()
 
 double FixNeighborSwap::energy_full()
 {
-  int eflag = 1;
-  int vflag = 0;
+  // flag that we only need to compute the global energy
+  int eflag = ENERGY_GLOBAL | ENERGY_ONLY;
+  int vflag = VIRIAL_NONE;
 
-  if (modify->n_pre_force) modify->pre_force(vflag);
+  if (modify->has_fixes(FixConst::PRE_FORCE)) modify->pre_force(vflag);
 
   if (force->pair) force->pair->compute(eflag, vflag);
 
@@ -648,7 +633,7 @@ double FixNeighborSwap::energy_full()
 
   if (force->kspace) force->kspace->compute(eflag, vflag);
 
-  if (modify->n_post_force_any) modify->post_force(vflag);
+  if (modify->has_fixes(FixConst::POST_FORCE_ANY)) modify->post_force(vflag);
 
   update->eflag_global = update->ntimestep;
   double total_energy = c_pe->compute_scalar();
@@ -752,10 +737,10 @@ void FixNeighborSwap::build_i_neighbor_list(int i_center)
 
     // Find local voronoi entry with selected central atom
     if ((int) voro_neighbor_list[n][0] == id_center) {
-      temp_j_id = voro_neighbor_list[n][1]; // NOLINT
+      temp_j_id = voro_neighbor_list[n][1];    // NOLINT
       temp_j = -1;
     } else if (((int) voro_neighbor_list[n][1] == id_center) && (i_center < 0)) {
-      temp_j_id = voro_neighbor_list[n][0]; // NOLINT
+      temp_j_id = voro_neighbor_list[n][0];    // NOLINT
       temp_j = -1;
     } else {
       continue;
@@ -1085,11 +1070,11 @@ int FixNeighborSwap::image(int *&objs, double **&parms)
       idx = atom->map(key);
       if (idx < 0) continue;
       imgobjs[n] = Graphics::SPHERE;
-      imgparms[n][0] = data.second; // use stored pre-swap atom type
+      imgparms[n][0] = data.second;    // use stored pre-swap atom type
       imgparms[n][1] = x[idx][0];
       imgparms[n][2] = x[idx][1];
       imgparms[n][3] = x[idx][2];
-      imgparms[n][4] = 0.0;     // radius is set with fflag2 in dump image
+      imgparms[n][4] = 0.0;    // radius is set with fflag2 in dump image
       ++n;
     }
   }

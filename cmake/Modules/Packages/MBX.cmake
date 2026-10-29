@@ -1,13 +1,14 @@
 # MBX v1.3.0+ support for MBX package
 # Based off of PLUMED.cmake
 
-# set policy to silence warnings about timestamps of downloaded files. review occasionally if it may be set to NEW
+# set policy to use the time of extraction as timestamps of files unpacked from downloaded
+# archives, so that updating an archive version triggers rebuilding all dependent objects
 if(POLICY CMP0135)
-  cmake_policy(SET CMP0135 OLD)
+  cmake_policy(SET CMP0135 NEW)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  message(FATAL_ERROR "Compiling the MBX package for Windows is currently not supported")
+if((CMAKE_SYSTEM_NAME STREQUAL "Windows") AND (NOT CMAKE_CROSSCOMPILING))
+  message(FATAL_ERROR "Compiling the MBX package natively for Windows is currently not supported")
 endif()
 
 # for supporting multiple concurrent mbx installations for debugging and testing
@@ -18,8 +19,12 @@ set(MBX_CONFIG_CC  ${CMAKE_C_COMPILER})
 set(MBX_CONFIG_CXX  ${CMAKE_CXX_COMPILER})
 if(BUILD_MPI)
   set(MBX_CONFIG_FLAGS "--enable-mpi")
-  set(MBX_CONFIG_CC  ${MPI_C_COMPILER})
-  set(MBX_CONFIG_CXX  ${MPI_CXX_COMPILER})
+  if(MPI_C_COMPILER)
+    set(MPI_CONFIG_CC  ${MPI_C_COMPILER})
+  endif()
+  if(MPI_CXX_COMPILER)
+    set(MBX_CONFIG_CXX  ${MPI_CXX_COMPILER})
+  endif()
 else()
   set(MBX_CONFIG_FLAGS "--disable-mpi")
 endif()
@@ -33,12 +38,6 @@ endif()
 if(CONFIGURE_REQUEST_PIC)
   list(APPEND MBX_CONFIG_FLAGS ${CONFIGURE_REQUEST_PIC})
 endif()
-
-set(MBXLIB_URL "https://github.com/paesanilab/MBX/releases/download/v1.3.5/mbx-1.3.5.tar.gz" CACHE STRING "URL for MBX tarball")
-set(MBXLIB_MD5 "2ffdcdbebf3c10ba010c573545a33d47" CACHE STRING "MD5 checksum of MBX tarball")
-
-mark_as_advanced(MBXLIB_URL)
-mark_as_advanced(MBXLIB_MD5)
 
 set(MBX_LINK_LIBS)
 find_package(FFTW3 REQUIRED)
@@ -58,6 +57,22 @@ endif()
 option(DOWNLOAD_MBX "Download MBX package instead of using an already installed one" ${DOWNLOAD_MBX_DEFAULT})
 if(DOWNLOAD_MBX)
   message(STATUS "MBX download requested - we will build our own")
+  SetDownloadSettings(MBXLIB "MBX"
+    "https://github.com/paesanilab/MBX/releases/download/v1.4.0/mbx-1.4.0.tar.gz"
+    "219de5af7cd81bdf8c3394c3aeee923cf4de7dd322769441a35c7cf4950bf912")
+
+  # apply patches to the MBX sources of known versions (e.g. so that they compile without OpenMP)
+  get_filename_component(_mbx_archive "${MBXLIB_URL}" NAME)
+  string(REGEX REPLACE "\\.(tar\\.gz|tgz|tar\\.xz|txz|zip)$" "" _mbx_version "${_mbx_archive}")
+  set(MBX_PATCH_FILE ${LAMMPS_DIR}/cmake/patches/${_mbx_version}-openmp.patch)
+  set(MBX_PATCH_COMMAND)
+  if(EXISTS ${MBX_PATCH_FILE})
+    find_package(Patch REQUIRED)
+    message(STATUS "Patching MBX sources with ${MBX_PATCH_FILE}")
+    set(MBX_PATCH_COMMAND COMMAND ${Patch_EXECUTABLE} -p1 -i ${MBX_PATCH_FILE})
+  else()
+    message(STATUS "No patch file ${MBX_PATCH_FILE} found for MBX archive ${_mbx_archive}")
+  endif()
   set(MBX_BUILD_BYPRODUCTS "<INSTALL_DIR>/lib/${CMAKE_STATIC_LIBRARY_PREFIX}mbx${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
   message(STATUS "MBX_CONFIG_CC: ${MBX_CONFIG_CC}")
@@ -65,17 +80,44 @@ if(DOWNLOAD_MBX)
   message(STATUS "MBX_CONFIG_FLAGS: ${MBX_CONFIG_FLAGS}")
 
   include(ExternalProject)
-  ExternalProject_Add(mbx_build
-    URL     ${MBXLIB_URL}
-    URL_HASH MD5=${MBXLIB_MD5}
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure
-                      --prefix=<INSTALL_DIR>
-                      ${MBX_CONFIG_FLAGS}
-                      CXX=${MBX_CONFIG_CXX}
-                      CC=${MBX_CONFIG_CC}
-                      CPPFLAGS=-I${FFTW3_INCLUDE_DIRS}
-    BUILD_BYPRODUCTS ${MBX_BUILD_BYPRODUCTS}
-  )
+
+  # hacks to make Linux-to-Windows cross-compilation work
+  if((CMAKE_SYSTEM_NAME STREQUAL "Windows") AND (CMAKE_CROSSCOMPILING))
+    ExternalProject_Add(mbx_build
+      URL     ${MBXLIB_URL}
+      URL_HASH SHA256=${MBXLIB_SHA256}
+      BUILD_IN_SOURCE TRUE
+      # restore the timestamp order that autotools generated files require (see AutotoolsTouch.cmake)
+      PATCH_COMMAND ${CMAKE_COMMAND} -D SOURCE_DIR=<SOURCE_DIR> -P ${LAMMPS_DIR}/cmake/Modules/AutotoolsTouch.cmake
+                    ${MBX_PATCH_COMMAND}
+      CONFIGURE_COMMAND mingw64-configure
+                        --prefix=<INSTALL_DIR>
+                        --disable-i-pi-plugin
+                        ${MBX_CONFIG_FLAGS}
+      INSTALL_COMMAND make install prefix=-build includedir=/include bindir=/bin
+                                 datadir=/share exec_prefix=/ infodir=/share/info
+                                 libdir=/lib libexecdir=/libexec localstatedir=/var
+                                 mandir=/share/man sbindir=/sbin sharedstatedir=/com
+                                 sysconfdir=/etc DESTDIR=<INSTALL_DIR>
+      BUILD_BYPRODUCTS ${MBX_BUILD_BYPRODUCTS}
+    )
+  else()
+    ExternalProject_Add(mbx_build
+      URL     ${MBXLIB_URL}
+      URL_HASH SHA256=${MBXLIB_SHA256}
+      # restore the timestamp order that autotools generated files require (see AutotoolsTouch.cmake)
+      PATCH_COMMAND ${CMAKE_COMMAND} -D SOURCE_DIR=<SOURCE_DIR> -P ${LAMMPS_DIR}/cmake/Modules/AutotoolsTouch.cmake
+                    ${MBX_PATCH_COMMAND}
+      CONFIGURE_COMMAND <SOURCE_DIR>/configure
+                        --prefix=<INSTALL_DIR>
+                        --disable-i-pi-plugin
+                        ${MBX_CONFIG_FLAGS}
+                        CXX=${MBX_CONFIG_CXX}
+                        CC=${MBX_CONFIG_CC}
+                        CPPFLAGS=-I${FFTW3_INCLUDE_DIRS}
+      BUILD_BYPRODUCTS ${MBX_BUILD_BYPRODUCTS}
+    )
+  endif()
   ExternalProject_get_property(mbx_build INSTALL_DIR)
   add_library(LAMMPS::MBX UNKNOWN IMPORTED)
   add_dependencies(LAMMPS::MBX mbx_build)

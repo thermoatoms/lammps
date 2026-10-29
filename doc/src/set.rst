@@ -23,7 +23,7 @@ Syntax
 
 * one or more keyword/value pairs may be appended
 
-* keyword = *angle* or *angmom* or *apip/lambda* or *bond* or *cc* or *charge*
+* keyword = *angle* or *angmom* or *apip/lambda* or *block* or *bond* or *cc* or *charge*
   or *density* or *density/disc* or *diameter* or *dihedral* or *dipole*
   or *dipole/random* or *dpd/theta* or *edpd/cv* or *edpd/temp* or
   *epsilon* or *image* or *improper* or *length* or *mass* or *mol* or
@@ -45,6 +45,8 @@ Syntax
          fast = switching parameter of fast potential (1)
          precise = switching parameter of fast potential (0)
          float = constant float or atom-style variable (between 0 and 1)
+       *block* value = block1, block2
+         block1,block2 = 2 blockiness parameters for superellipsoids
        *bond* value = numeric bond type or bond type label, for all bonds between selected atoms
        *cc* values = index cc
          index = index of a chemical species (1 to Nspecies)
@@ -182,6 +184,7 @@ Examples
    set atom * charge v_atomfile
    set atom 100*200 x 0.5 y 1.0
    set atom 100 vx 0.0 vy 0.0 vz -1.0
+   set atom 200 shape 1.5 2.0 4.0 block 2.0 4.0
    set atom 1492 type 3
    set atom 1492 type H
    set atom * i_myVal 5
@@ -538,6 +541,25 @@ other. Note that the SPH smoothing kernel diameter used for computing
 long range, nonlocal interactions, is set using the *diameter*
 keyword.
 
+.. versionadded:: 30Mar2026
+
+Keyword *block* sets the blockiness of the selected atoms.  The
+particles must be ellipsoids as defined by the :doc:`atom_style
+ellipsoid <atom_style>` command.  This command is used to define
+superellipsoid particle shapes for use in granular simulations.  The
+*block1*, *block2* settings are the 2 exponents of the superellipsoid in
+the vertical and horizontal directions.  Vertical sections through the
+center are superellipses with squareness *block1* and horizontal
+sections are superellipses with squareness *block2*.  If both parameters
+are set to a value of 2 (the default), the atom is a regular ellipsoid.
+The keyword *block* should be used together with the keyword *shape* to
+give the particle the desired shape.  If the keyword *block* is given
+alone, and the *shape* has not been defined, e.g., in a previous *set*
+command, the 3 diameters would be set to a value of 1 internally.  Note
+that this command does not adjust the particle mass, even if it was
+defined with a density, e.g. via the :doc:`read_data <read_data>`
+command.
+
 Keyword *smd/mass/density* sets the mass of all selected particles,
 but it is only applicable to the Smooth Mach Dynamics package MACHDYN.
 It assumes that the particle volume has already been correctly set and
@@ -545,14 +567,8 @@ calculates particle mass from the provided mass density value.
 
 Keywords *sph/cv*, *sph/e*, and *sph/rho* set the heat capacity,
 energy, and density of smoothed particle hydrodynamics (SPH)
-particles.  See `this PDF guide <PDF/SPH_LAMMPS_userguide.pdf>`_ to
+particles.  See the :doc:`Howto sph <Howto_sph>` page for an introduction to
 using SPH in LAMMPS.
-
-.. note::
-
-   Note that the SPH PDF guide file has not been updated for many
-   years and thus does not reflect the current *syntax* of the SPH
-   package commands. For that, please refer to the LAMMPS manual.
 
 .. versionchanged:: 15Sep2022
 
